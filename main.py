@@ -793,31 +793,38 @@ class MainWindow(QMainWindow):
         try:
             from update.manager import UpdateManager
             
-            manager = UpdateManager()
+            self.log.appendPlainText(f"{Icons.INFO} Проверка обновлений... Текущая версия: {__version__}")
+            manager = UpdateManager(__version__)
             latest_info = manager.check_for_update()
             
             if latest_info:
-                current = __version__
                 latest = latest_info.get('version', 'unknown')
-                if latest > current:
-                    reply = QMessageBox.question(
-                        self, "Обновление",
-                        f"Доступна новая версия {latest}\nТекущая версия: {current}\n\nЗагрузить обновление?",
-                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-                    )
-                    if reply == QMessageBox.StandardButton.Yes:
-                        manager.download_and_install(latest_info)
-                        self.log.appendPlainText(f"{Icons.SUCCESS} Обновление загружено и установлено. Пожалуйста, перезагрузите приложение.")
-                else:
-                    QMessageBox.information(self, "Обновление", f"У вас уже установлена последняя версия {current}")
+                self.log.appendPlainText(f"{Icons.INFO} Доступна новая версия: {latest}")
+                reply = QMessageBox.question(
+                    self, "Обновление",
+                    f"Доступна новая версия {latest}\nТекущая версия: {__version__}\n\nЗагрузить обновление?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                )
+                if reply == QMessageBox.StandardButton.Yes:
+                    self.log.appendPlainText(f"{Icons.INFO} Загрузка обновления...")
+                    if manager.download():
+                        self.log.appendPlainText(f"{Icons.SUCCESS} Обновление загружено")
+                        if manager.install():
+                            self.log.appendPlainText(f"{Icons.SUCCESS} Обновление установлено. Приложение перезапустится...")
+                            QMessageBox.information(self, "Обновление", "Обновление установлено!\nПриложение перезапустится автоматически.")
+                            sys.exit(0)
+                        else:
+                            self.log.appendPlainText(f"{Icons.ERROR} Ошибка установки")
+                    else:
+                        self.log.appendPlainText(f"{Icons.ERROR} Ошибка загрузки")
             else:
-                QMessageBox.warning(self, "Обновление", "Не удалось проверить доступность обновлений")
+                QMessageBox.information(self, "Обновление", f"У вас уже установлена последняя версия {__version__}")
+                self.log.appendPlainText(f"{Icons.INFO} У вас последняя версия")
         except Exception as e:
             QMessageBox.critical(self, "Ошибка", f"Ошибка проверки обновления: {e}")
             self.log.appendPlainText(f"{Icons.ERROR} Ошибка проверки обновления: {e}")
-
-    def on_load_accounts(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Выберите файл с аккаунтами", "", "Excel (*.xlsx)")
+            import traceback
+            self.log.appendPlainText(traceback.format_exc())
         if not path:
             return
         df = pd.read_excel(path)
