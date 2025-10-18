@@ -720,6 +720,24 @@ class MainWindow(QMainWindow):
         self.log = QPlainTextEdit(); self.log.setReadOnly(True)
         v.addWidget(self.log, stretch=1)
 
+        # Status bar с кнопкой обновить и версией
+        status_layout = QHBoxLayout()
+        status_layout.addStretch()
+        self.btn_update = QPushButton("🔄 Обновить")
+        self.btn_update.setMaximumWidth(150)
+        status_layout.addWidget(self.btn_update)
+        try:
+            from core.version import __version__
+            version_text = f"v{__version__}"
+        except:
+            version_text = "v1.0.0"
+        self.version_label = QLabel(version_text)
+        self.version_label.setStyleSheet("color: #888; font-size: 10px; margin-right: 10px;")
+        status_layout.addWidget(self.version_label)
+        status_widget = QWidget()
+        status_widget.setLayout(status_layout)
+        v.addWidget(status_widget)
+
         # Подключаем обработчики событий для новых кнопок
         self.btn_add_account.clicked.connect(self.on_add_account)
         self.btn_edit_account.clicked.connect(self.on_edit_account)
@@ -738,6 +756,7 @@ class MainWindow(QMainWindow):
         self.btn_pause.clicked.connect(self.on_pause)
         self.btn_stop.clicked.connect(self.on_stop)
         self.btn_export.clicked.connect(self.on_export_report)
+        self.btn_update.clicked.connect(self.on_check_update)
         self.cmb_theme.currentIndexChanged.connect(self.on_theme_combo_changed)
 
         self.worker = Worker(self.accounts)
@@ -765,6 +784,35 @@ class MainWindow(QMainWindow):
         self.load_settings()
         # Применим текущую настройку/системную по умолчанию
         self.apply_theme(self.theme_pref)
+    
+    def on_check_update(self):
+        """Проверить доступность обновления."""
+        try:
+            from update.manager import UpdateManager
+            from core.version import __version__
+            
+            manager = UpdateManager()
+            latest_info = manager.check_for_update()
+            
+            if latest_info:
+                current = __version__
+                latest = latest_info.get('version', 'unknown')
+                if latest > current:
+                    reply = QMessageBox.question(
+                        self, "Обновление",
+                        f"Доступна новая версия {latest}\nТекущая версия: {current}\n\nЗагрузить обновление?",
+                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                    )
+                    if reply == QMessageBox.StandardButton.Yes:
+                        manager.download_and_install(latest_info)
+                        self.log.appendPlainText(f"{Icons.SUCCESS} Обновление загружено и установлено. Пожалуйста, перезагрузите приложение.")
+                else:
+                    QMessageBox.information(self, "Обновление", f"У вас уже установлена последняя версия {current}")
+            else:
+                QMessageBox.warning(self, "Обновление", "Не удалось проверить доступность обновлений")
+        except Exception as e:
+            QMessageBox.critical(self, "Ошибка", f"Ошибка проверки обновления: {e}")
+            self.log.appendPlainText(f"{Icons.ERROR} Ошибка проверки обновления: {e}")
 
     def on_load_accounts(self):
         path, _ = QFileDialog.getOpenFileName(self, "Выберите файл с аккаунтами", "", "Excel (*.xlsx)")
