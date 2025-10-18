@@ -171,14 +171,22 @@ class UpdateManager:
                     "setlocal enableextensions\r\n"
                     "set \"NEW=%~1\"\r\n"
                     "set \"TARGET=%~2\"\r\n"
+                    "set \"PID=%~3\"\r\n"
+                    "set \"LOGDIR=%~4\"\r\n"
                     "set \"SELF=%~f0\"\r\n"
+                    "if not exist \"%LOGDIR%\" mkdir \"%LOGDIR%\"\r\n"
+                    "set \"LOG=%LOGDIR%\\updater.log\"\r\n"
+                    ">>\"%LOG%\" echo [%%DATE%% %%TIME%%] Updater start. NEW=\"%NEW%\" TARGET=\"%TARGET%\" PID=%PID%\r\n"
                     ":wait\r\n"
-                    ">nul 2>&1 tasklist /fi \"imagename eq %~nx2\" | find /i \"%~nx2\" >nul\r\n"
-                    "if %errorlevel%==0 ( timeout /t 1 /nobreak >nul & goto wait )\r\n"
+                    ">>\"%LOG%\" echo [%%DATE%% %%TIME%%] Waiting process PID=%PID% to exit...\r\n"
+                    ">nul 2>&1 tasklist /fi \"pid eq %PID%\" | find \"%PID%\" && ( timeout /t 1 /nobreak >nul & goto wait )\r\n"
+                    ">>\"%LOG%\" echo [%%DATE%% %%TIME%%] Process exited, replacing file...\r\n"
                     ":copyloop\r\n"
-                    "copy /y \"%NEW%\" \"%TARGET%\" >nul 2>&1\r\n"
-                    "if errorlevel 1 ( timeout /t 1 >nul & goto copyloop )\r\n"
-                    "start \"\" \"%TARGET%\"\r\n"
+                    "copy /y \"%NEW%\" \"%TARGET%\" >>\"%LOG%\" 2>&1\r\n"
+                    "if errorlevel 1 ( >>\"%LOG%\" echo [%%DATE%% %%TIME%%] copy failed, retry... & timeout /t 1 >nul & goto copyloop )\r\n"
+                    ">>\"%LOG%\" echo [%%DATE%% %%TIME%%] Starting new binary...\r\n"
+                    "start \"\" /D \"%~dp2\" \"%TARGET%\"\r\n"
+                    ">>\"%LOG%\" echo [%%DATE%% %%TIME%%] Cleanup...\r\n"
                     "del /q \"%NEW%\" >nul 2>&1\r\n"
                     "del /q \"%SELF%\" >nul 2>&1\r\n"
                     "endlocal\r\n"
@@ -188,7 +196,9 @@ class UpdateManager:
                 log.info(f"[update] Updater script: {tmp_bat}")
                 # Launch batch to swap and restart hidden
                 creationflags = getattr(subprocess, 'CREATE_NO_WINDOW', 0) | getattr(subprocess, 'DETACHED_PROCESS', 0)
-                subprocess.Popen(["cmd", "/c", str(tmp_bat), str(new_file), str(exe)], creationflags=creationflags)
+                pid = os.getpid()
+                log_dir = exe.parent / "logs"
+                subprocess.Popen(["cmd", "/c", str(tmp_bat), str(new_file), str(exe), str(pid), str(log_dir)], creationflags=creationflags)
                 return True
             except Exception as e:
                 log.error(f"[update] Install (Windows) failed: {e}")
