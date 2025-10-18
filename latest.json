@@ -1,10 +1,10 @@
 {
-  "version": "1.0.2",
-  "notes": "Обновлён автообновлятор: одно уведомление, асинхронная загрузка без фризов, автоперезапуск.",
+  "version": "1.0.3",
+  "notes": "Технический релиз: версия повышена до 1.0.3 для проверки автообновления.",
   "assets": {
     "windows": {
-      "url": "https://github.com/worryeed/ClubSender/releases/download/v1.0.2/ClubSender.exe",
-      "sha256": "7EA0AF4ED681E5B641E7CEA282FF8C19CD06326982B7EFEE67A26F083C783536"
+      "url": "https://github.com/worryeed/ClubSender/releases/download/v1.0.3/ClubSender.exe",
+      "sha256": "D79575F8AD1C885B4E44C1081A033BCE0E2242B4D919CB23600337B2EE1C9E17"
     }
   }
 }
