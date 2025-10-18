@@ -1,0 +1,183 @@
+from __future__ import annotations
+import os
+import sys
+import json
+import hashlib
+import tempfile
+import subprocess
+from pathlib import Path
+from typing import Optional, Callable, Dict, Any
+
+import requests
+
+DEFAULT_MANIFEST_URL = "https://worryeed.github.io/ClubSender/latest.json"
+
+
+def _semver_tuple(v: str) -> tuple:
+    parts = (v or "0").strip().split(".")
+    out = []
+    for p in parts:
+        try:
+            out.append(int(p))
+        except Exception:
+            # strip non-digits like '1.0.0-beta'
+            num = ''.join(ch for ch in p if ch.isdigit())
+            out.append(int(num or 0))
+    # normalize length
+    while len(out) < 3:
+        out.append(0)
+    return tuple(out[:3])
+
+
+class UpdateManager:
+    """Простой менеджер обновлений без PyUpdater.
+
+    Ожидаемый формат манифеста (gh-pages/latest.json):
+    {
+      "version": "1.0.1",
+      "notes": "...",
+      "assets": {
+        "windows": {
+          "url": "https://.../ClubSender-1.0.1.exe",
+          "sha256": "<hex>"
+        }
+      }
+    }
+    Поля-совместимости: допускается {"current": "1.0.1"} или {"download_url": "..."}.
+    """
+
+    def __init__(self, current_version: str, manifest_url: str = DEFAULT_MANIFEST_URL):
+        self.current_version = str(current_version)
+        self.manifest_url = manifest_url
+        self._update_info: Optional[Dict[str, Any]] = None
+        self._downloaded_path: Optional[Path] = None
+
+    def _fetch_manifest(self) -> Optional[Dict[str, Any]]:
+        try:
+            r = requests.get(self.manifest_url, timeout=10)
+            r.raise_for_status()
+            return r.json()
+        except Exception:
+            return None
+
+    def _select_asset(self, manifest: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        # Version field: prefer 'version', fallback to 'current'
+        version = manifest.get("version") or manifest.get("current")
+        if not version:
+            return None
+        asset = None
+        assets = manifest.get("assets") or {}
+        if sys.platform.startswith("win"):
+            asset = assets.get("windows") or assets.get("win32") or assets.get("win")
+        # Fallbacks for simple manifests
+        if asset is None and manifest.get("download_url"):
+            asset = {"url": manifest.get("download_url"), "sha256": manifest.get("sha256")}
+        if not asset or not asset.get("url"):
+            return None
+        return {"version": version, "url": asset["url"], "sha256": asset.get("sha256"), "notes": manifest.get("notes", "")}
+
+    def check_for_update(self) -> Optional[Dict[str, Any]]:
+        m = self._fetch_manifest()
+        if not m:
+            return None
+        sel = self._select_asset(m)
+        if not sel:
+            return None
+        cur = _semver_tuple(self.current_version)
+        lat = _semver_tuple(sel["version"])
+        if lat > cur:
+            self._update_info = sel
+            return sel
+        return None
+
+    def _sha256(self, path: Path) -> str:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(8192), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
+    def download(self, progress_cb: Optional[Callable[[int], None]] = None) -> bool:
+        if not self._update_info:
+            return False
+        url = self._update_info["url"]
+        try:
+            with requests.get(url, stream=True, timeout=30) as r:
+                r.raise_for_status()
+                total = int(r.headers.get("content-length", 0))
+                fd, tmp = tempfile.mkstemp(prefix="clubsender_update_")
+                os.close(fd)
+                p = Path(tmp)
+                downloaded = 0
+                with open(p, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=65536):
+                        if not chunk:
+                            continue
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        if progress_cb and total > 0:
+                            pct = int(downloaded * 100 / total)
+                            progress_cb(pct)
+                # verify sha256 if provided
+                expect = (self._update_info.get("sha256") or "").lower().strip()
+                if expect:
+                    actual = self._sha256(p)
+                    if actual.lower() != expect:
+                        try:
+                            p.unlink(missing_ok=True)  # type: ignore[arg-type]
+                        except Exception:
+                            pass
+                        return False
+                self._downloaded_path = p
+                return True
+        except Exception:
+            return False
+
+    def install(self) -> bool:
+        if not self._downloaded_path:
+            return False
+        # Windows onefile update strategy
+        if sys.platform.startswith("win"):
+            return self._install_windows(self._downloaded_path)
+        # For other platforms, attempt to launch downloaded file
+        try:
+            subprocess.Popen([str(self._downloaded_path)])
+            return True
+        except Exception:
+            return False
+
+    def _install_windows(self, new_file: Path) -> bool:
+        exe = Path(sys.executable)
+        # If running from PyInstaller onefile
+        if getattr(sys, "frozen", False) and exe.suffix.lower() == ".exe":
+            # Create inline updater .bat to replace exe after exit
+            try:
+                bat = exe.with_suffix(".update.bat")
+                bat.write_text(
+                    """
+@echo off
+setlocal enableextensions
+set NEW=%1
+set TARGET=%2
+:waitloop
+timeout /t 1 /nobreak >nul
+(del /f /q "%TARGET%") >nul 2>&1
+if exist "%TARGET%" goto waitloop
+move /y "%NEW%" "%TARGET%" >nul 2>&1
+start "" "%TARGET%"
+endlocal
+exit
+""".strip(),
+                    encoding="utf-8",
+                )
+                # Launch batch to swap and restart; pass quoted paths
+                subprocess.Popen(["cmd", "/c", str(bat), str(new_file), str(exe)])
+                return True
+            except Exception:
+                return False
+        # Not frozen: just launch the downloaded binary/installer
+        try:
+            subprocess.Popen([str(new_file)])
+            return True
+        except Exception:
+            return False

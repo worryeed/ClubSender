@@ -1,36 +1,37 @@
-# Обновления (PyUpdater)
+# Обновления (кастомный механизм + PyInstaller)
 
-Этот проект использует PyUpdater для проверки и загрузки обновлений.
+Приложение проверяет latest.json на GitHub Pages и скачивает новый .exe при наличии версии новее.
 
 ## Хостинг
 - GitHub Pages: ветка `gh-pages`, корень (`/`).
-- URL манифеста: `https://worryeed.github.io/ClubSender/`.
+- Манифест: `https://worryeed.github.io/ClubSender/latest.json`.
 
 ## Версия приложения
 - Файл: `core/version.py`, поле `__version__` (SemVer, например `1.0.0`).
 
-## Генерация ключей (локально, вне репозитория)
-```bash
-pip install pyupdater
-pyupdater init
-pyupdater keys -c
+## Пример latest.json
+```json
+{
+  "version": "1.0.1",
+  "notes": "Minor fixes",
+  "assets": {
+    "windows": {
+      "url": "https://worryeed.github.io/ClubSender/ClubSender-1.0.1.exe",
+      "sha256": "<hex>"
+    }
+  }
+}
 ```
-Публичный ключ пропишите через переменную окружения `CLUBSENDER_PYU_PUBKEY` (или внесите в `update/updater.py` в `AppClientConfig.PUBLIC_KEY`).
 
-## Сборка и публикация релиза
-Вариант A (упакованный .exe через PyInstaller):
+## Релиз
+1) Собрать `.exe` (PyInstaller):
 ```bash
-pip install pyinstaller pyupdater
+pip install pyinstaller
 pyinstaller --noconfirm --onefile --name ClubSender main.py
-# Подготовка пакетов для PyUpdater
-pyupdater build --app-version 1.0.1 ClubSender
-pyupdater pkg -S   # подпись и подготовка к диплою
-# В каталоге deploy/ — файлы для публикации. Залейте содержимое deploy/ в ветку gh-pages корень.
 ```
-
-Вариант B (портативный zip со скриптами):
-- Упакуйте необходимые файлы в zip и интегрируйте с PyUpdater аналогично, затем разместите на gh-pages.
+2) Положить `ClubSender-<ver>.exe` и `latest.json` в корень ветки `gh-pages`.
+3) Обновить `core/version.py` на эту же версию и запушить в `main`.
 
 ## Работа клиента
 - Кнопка "Проверить обновление" в GUI.
-- Автопроверка при старте. Установка — только по подтверждению и без прерывания текущих задач.
+- Автопроверка при старте. Для onefile на Windows: загрузит новый `.exe` и предложит заменить текущий (перезапуск через временный .bat).
