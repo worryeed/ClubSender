@@ -1,10 +1,10 @@
 {
-  "version": "1.0.8",
-  "notes": "Updater fix: ожидание PID, запуск из папки exe, логирование в logs/updater.log.",
+  "version": "1.0.9",
+  "notes": "Технический релиз: версия 1.0.9 (без изменений функционала).",
   "assets": {
     "windows": {
-      "url": "https://github.com/worryeed/ClubSender/releases/download/v1.0.8/ClubSender.exe",
-      "sha256": "664FA3CA3137502C62B5FED959E638F7C4E6989D1C8007468D558360E9FCE971"
+      "url": "https://github.com/worryeed/ClubSender/releases/download/v1.0.9/ClubSender.exe",
+      "sha256": "4F07675E4BA09386BB0E7E1CBBC6803101DE3E3257BD643287542B0503FEFC8F"
     }
   }
 }
