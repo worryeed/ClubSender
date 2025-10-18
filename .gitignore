@@ -1,0 +1,46 @@
+# Logs
+*.log
+*.out.log
+logs/
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Test/IDE caches
+.pytest_cache/
+.idea/
+.vscode/
+.mypy_cache/
+.pytype/
+htmlcov/
+.coverage*
+
+# Build / packaging
+build/
+dist/
+*.spec
+*.bin
+*.zip
+*.7z
+*.tar
+*.tar.gz
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Local data / secrets
+*.xlsx
+
+# PyUpdater local data (keys/manifests) — keep out of VCS
+pyu-data/
+files/xpoker_settings.json
+files/xpoker_gui.log
+

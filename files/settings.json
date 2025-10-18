@@ -1,0 +1,11 @@
+{
+  "api_url": "https://api.x-poker.net",
+  "tcp_host": "158.160.128.14",
+  "tcp_port": 5000,
+  "delay": 5,
+  "timeout": 30,
+  "mode": "tcp",
+  "autosave": true,
+  "use_proxy": false,
+  "debug_mode": true
+}
