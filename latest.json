@@ -1,10 +1,10 @@
 {
-  "version": "1.0.11",
-  "notes": "Технический релиз: версия 1.0.11 (без изменений функционала).",
+  "version": "1.0.12",
+  "notes": "Batch updater fixes: stable PID wait (tasklist CSV), correct date/time logging, background start from exe dir.",
   "assets": {
     "windows": {
-      "url": "https://github.com/worryeed/ClubSender/releases/download/v1.0.11/ClubSender.exe",
-      "sha256": "E9A7DF0A6D975F57D2AF6DCEBD0A4FABD297CD287260C7AECA5A42E0C04C93D8"
+      "url": "https://github.com/worryeed/ClubSender/releases/download/v1.0.12/ClubSender.exe",
+      "sha256": "D2BF57CBAA93FA4596BA50EF447D3F021D69B099D39BDC97EA4FBEEB0DD9515E"
     }
   }
 }
