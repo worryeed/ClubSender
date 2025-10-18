@@ -775,6 +775,13 @@ class MainWindow(QMainWindow):
             pass
         # Применим текущую настройку/системную по умолчанию
         self.apply_theme(self.theme_pref)
+        # Статус-бар с версией
+        try:
+            self.statusBar().showMessage("")
+            ver_lbl = QLabel(f"Версия: {__version__}")
+            self.statusBar().addPermanentWidget(ver_lbl)
+        except Exception:
+            pass
 
     def on_load_accounts(self):
         path, _ = QFileDialog.getOpenFileName(self, "Выберите файл с аккаунтами", "", "Excel (*.xlsx)")
@@ -1072,6 +1079,63 @@ class MainWindow(QMainWindow):
         # Запускаем задачу
         self.worker.set_task(task_debug_tcp_sequence)
         self.worker.start()
+
+    def on_check_update(self):
+        if UpdateManager is None:
+            QMessageBox.information(self, "Обновление", "Модуль обновления не установлен")
+            return
+        try:
+            if self.worker.isRunning():
+                QMessageBox.information(self, "Занято", "Сначала дождитесь завершения текущей задачи")
+                return
+            mgr = UpdateManager(__version__)
+            upd = mgr.check_for_update()
+            if not upd:
+                QMessageBox.information(self, "Обновление", f"Обновлений нет (версия {__version__})")
+                return
+            new_ver = getattr(upd, 'version', 'new')
+            reply = QMessageBox.question(
+                self, "Обновление доступно",
+                f"Найдена версия {new_ver}. Скачать?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+            self.log.appendPlainText(f"{Icons.INFO} Загрузка обновления {new_ver}...")
+            def _prog(pct: int):
+                try:
+                    self.log.appendPlainText(f"{Icons.INFO} Загрузка: {pct}%")
+                except Exception:
+                    pass
+            ok = mgr.download(progress_cb=_prog)
+            if not ok:
+                QMessageBox.critical(self, "Обновление", "Не удалось скачать обновление")
+                return
+            installed = mgr.install()
+            if installed:
+                QMessageBox.information(self, "Обновление", "Обновление готово. Перезапустите приложение, если оно не перезапустилось автоматически.")
+            else:
+                QMessageBox.critical(self, "Обновление", "Не удалось установить обновление")
+        except Exception as e:
+            QMessageBox.critical(self, "Ошибка обновления", str(e))
+
+    def check_update_silent(self):
+        if UpdateManager is None:
+            return
+        try:
+            mgr = UpdateManager(__version__)
+            upd = mgr.check_for_update()
+            if upd:
+                new_ver = getattr(upd, 'version', 'new')
+                reply = QMessageBox.question(
+                    self, "Доступно обновление",
+                    f"Найдена версия {new_ver}. Скачать сейчас?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                )
+                if reply == QMessageBox.StandardButton.Yes:
+                    self.on_check_update()
+        except Exception:
+            pass
 
     def on_export_report(self):
         if not self.report_rows:
@@ -1768,61 +1832,3 @@ def main():
     w.show()
     sys.exit(app.exec())
 
-    def on_check_update(self):
-        try:
-            if self.worker.isRunning():
-                QMessageBox.information(self, "Занято", "Сначала дождитесь завершения текущей задачи")
-                return
-            mgr = UpdateManager(__version__)
-            upd = mgr.check_for_update()
-            if not upd:
-                QMessageBox.information(self, "Обновление", f"Обновлений нет (версия {__version__})")
-                return
-            # Есть обновление — спросим скачать
-            new_ver = getattr(upd, 'version', 'new')
-            reply = QMessageBox.question(
-                self, "Обновление доступно",
-                f"Найдена версия {new_ver}. Скачать?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-            )
-            if reply != QMessageBox.StandardButton.Yes:
-                return
-            # Скачиваем с простым прогрессом в логе
-            self.log.appendPlainText(f"{Icons.INFO} Загрузка обновления {new_ver}...")
-            def _prog(pct: int):
-                try:
-                    self.log.appendPlainText(f"{Icons.INFO} Загрузка: {pct}%")
-                except Exception:
-                    pass
-            ok = mgr.download(progress_cb=_prog)
-            if not ok:
-                QMessageBox.critical(self, "Обновление", "Не удалось скачать обновление")
-                return
-            # Устанавливаем (для упакованной версии возможен автоперезапуск)
-            installed = mgr.install()
-            if installed:
-                QMessageBox.information(self, "Обновление", "Обновление готово. Перезапустите приложение, если оно не перезапустилось автоматически.")
-            else:
-                QMessageBox.critical(self, "Обновление", "Не удалось установить обновление")
-        except Exception as e:
-            QMessageBox.critical(self, "Ошибка обновления", str(e))
-
-    def check_update_silent(self):
-        try:
-            mgr = UpdateManager(__version__)
-            upd = mgr.check_for_update()
-            if upd:
-                new_ver = getattr(upd, 'version', 'new')
-                # Ненавязчивое уведомление с предложением скачать
-                reply = QMessageBox.question(
-                    self, "Доступно обновление",
-                    f"Найдена версия {new_ver}. Скачать сейчас?",
-                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-                )
-                if reply == QMessageBox.StandardButton.Yes:
-                    self.on_check_update()
-        except Exception:
-            pass
-
-if __name__ == "__main__":
-    main()
