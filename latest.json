@@ -1,10 +1,10 @@
 {
-  "version": "1.0.18",
-  "notes": "Версия 1.0.18. Обновлен PowerShell-скрипт для улучшенного обновления.",
+  "version": "1.0.19",
+  "notes": "Тестовая версия ClubSender v1.0.19",
   "assets": {
     "windows": {
-      "url": "https://github.com/worryeed/ClubSender/releases/download/v1.0.18/ClubSender.exe",
-      "sha256": "AE0345128107FB1AD7A4B3BA2E9A21D0C243BE12C7D3885C677918A4582E377B"
+      "url": "https://github.com/worryeed/ClubSender/releases/download/v1.0.19/ClubSender.exe",
+      "sha256": "57C821F6E78C6E096B1423EEF8A872C7CC8E1E87C579A586244824F2C882C319"
     }
   }
 }
