@@ -36,8 +36,10 @@ except Exception:
         _qdt_api = None
 
 from core import Account, JoinResult, XPokerAPI, ApiError
-from core.version import __version__
 from core.messages import Icons, format_login_step, format_join_result, MESSAGES
+
+# Версия приложения
+__version__ = "1.0.19"
 
 APP_TITLE = "Little Pony Games API Manager"
 ACCOUNTS_COLUMNS = ["Имя пользователя", "Пароль", "Прокси", "ID устройства", "Токен (кратко)", "Последний вход"]
