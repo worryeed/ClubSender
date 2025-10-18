@@ -1,10 +1,10 @@
 {
-  "version": "1.0.12",
-  "notes": "Batch updater fixes: stable PID wait (tasklist CSV), correct date/time logging, background start from exe dir.",
+  "version": "1.0.13",
+  "notes": "PowerShell updater: Wait-Process, надёжная замена с ретраями, старт скрытно из папки exe.",
   "assets": {
     "windows": {
-      "url": "https://github.com/worryeed/ClubSender/releases/download/v1.0.12/ClubSender.exe",
-      "sha256": "D2BF57CBAA93FA4596BA50EF447D3F021D69B099D39BDC97EA4FBEEB0DD9515E"
+      "url": "https://github.com/worryeed/ClubSender/releases/download/v1.0.13/ClubSender.exe",
+      "sha256": "300FE65E22EC4CB841482B1B3E57B1A444568AEC8FA9837179717B4965FDE5A4"
     }
   }
 }
