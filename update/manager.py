@@ -1,0 +1,194 @@
+from __future__ import annotations
+import os
+import sys
+import json
+import hashlib
+import tempfile
+import subprocess
+import time
+import logging
+from pathlib import Path
+from typing import Optional, Callable, Dict, Any
+
+import requests
+
+log = logging.getLogger(__name__)
+DEFAULT_MANIFEST_URL = "https://worryeed.github.io/ClubSender/latest.json"
+
+
+def _semver_tuple(v: str) -> tuple:
+    parts = (v or "0").strip().split(".")
+    out = []
+    for p in parts:
+        try:
+            out.append(int(p))
+        except Exception:
+            num = ''.join(ch for ch in p if ch.isdigit())
+            out.append(int(num or 0))
+    while len(out) < 3:
+        out.append(0)
+    return tuple(out[:3])
+
+
+class UpdateManager:
+    """Кастомный менеджер обновлений (манифест latest.json на gh-pages).
+
+    Формат манифеста:
+    {
+      "version": "1.0.x",
+      "notes": "...",
+      "assets": { "windows": { "url": "https://.../ClubSender.exe", "sha256": "<hex>" } }
+    }
+    """
+
+    def __init__(self, current_version: str, manifest_url: str = DEFAULT_MANIFEST_URL):
+        self.current_version = str(current_version)
+        self.manifest_url = manifest_url
+        self._update_info: Optional[Dict[str, Any]] = None
+        self._downloaded_path: Optional[Path] = None
+
+    def _fetch_manifest(self) -> Optional[Dict[str, Any]]:
+        try:
+            log.info(f"[update] Fetch manifest: {self.manifest_url}")
+            r = requests.get(self.manifest_url, timeout=10)
+            r.raise_for_status()
+            m = r.json()
+            log.info(f"[update] Manifest received: keys={list(m.keys())}")
+            return m
+        except Exception as e:
+            log.error(f"[update] Manifest fetch failed: {e}")
+            return None
+
+    def _select_asset(self, manifest: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        version = manifest.get("version") or manifest.get("current")
+        if not version:
+            return None
+        asset = (manifest.get("assets") or {}).get("windows")
+        if asset is None and manifest.get("download_url"):
+            asset = {"url": manifest.get("download_url"), "sha256": manifest.get("sha256")}
+        if not asset or not asset.get("url"):
+            return None
+        return {"version": version, "url": asset["url"], "sha256": asset.get("sha256"), "notes": manifest.get("notes", "")}
+
+    def check_for_update(self) -> Optional[Dict[str, Any]]:
+        m = self._fetch_manifest()
+        if not m:
+            return None
+        sel = self._select_asset(m)
+        if not sel:
+            log.warning("[update] No suitable asset in manifest")
+            return None
+        cur = _semver_tuple(self.current_version)
+        lat = _semver_tuple(sel["version"])
+        log.info(f"[update] Current={self.current_version} Latest={sel['version']} -> need_update={lat>cur}")
+        if lat > cur:
+            self._update_info = sel
+            return sel
+        return None
+
+    def _sha256(self, path: Path) -> str:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(8192), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
+    def download(self, progress_cb: Optional[Callable[[int], None]] = None) -> bool:
+        if not self._update_info:
+            return False
+        url = self._update_info["url"]
+        try:
+            log.info(f"[update] Download start: {url}")
+            with requests.get(url, stream=True, timeout=30) as r:
+                r.raise_for_status()
+                total = int(r.headers.get("content-length", 0))
+                fd, tmp = tempfile.mkstemp(prefix="clubsender_update_", suffix=".bin")
+                os.close(fd)
+                p = Path(tmp)
+                downloaded = 0
+                with open(p, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=65536):
+                        if not chunk:
+                            continue
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        if progress_cb and total > 0:
+                            pct = max(0, min(100, int(downloaded * 100 / total)))
+                            progress_cb(pct)
+                expect = (self._update_info.get("sha256") or "").lower().strip()
+                if expect:
+                    actual = self._sha256(p)
+                    log.info(f"[update] SHA256 actual={actual} expect={expect}")
+                    if actual.lower() != expect:
+                        try:
+                            p.unlink(missing_ok=True)
+                        except Exception:
+                            pass
+                        log.error("[update] Hash mismatch, abort")
+                        return False
+                self._downloaded_path = p
+                log.info(f"[update] Download complete: {p}")
+                return True
+        except Exception as e:
+            log.error(f"[update] Download failed: {e}")
+            return False
+
+    def install(self) -> bool:
+        if not self._downloaded_path:
+            return False
+        if sys.platform.startswith("win"):
+            return self._install_windows(self._downloaded_path)
+        try:
+            subprocess.Popen([str(self._downloaded_path)])
+            return True
+        except Exception as e:
+            log.error(f"[update] Install (non-Windows) failed: {e}")
+            return False
+
+    def _install_windows(self, new_file: Path) -> bool:
+        exe = Path(sys.executable)
+        if getattr(sys, "frozen", False) and exe.suffix.lower() == ".exe":
+            try:
+                tmp_bat = Path(tempfile.gettempdir()) / f"clubsender_update_{int(time.time())}.bat"
+                bat_script = (
+                    "@echo off\r\n"
+                    "setlocal enableextensions\r\n"
+                    "set \"NEW=%~1\"\r\n"
+                    "set \"TARGET=%~2\"\r\n"
+                    "set \"PID=%~3\"\r\n"
+                    "set \"LOGDIR=%~4\"\r\n"
+                    "set \"SELF=%~f0\"\r\n"
+                    "if not exist \"%LOGDIR%\" mkdir \"%LOGDIR%\"\r\n"
+                    "set \"LOG=%LOGDIR%\\updater.log\"\r\n"
+                    ">>\"%LOG%\" echo [%%DATE%% %%TIME%%] Updater start. NEW=\"%NEW%\" TARGET=\"%TARGET%\" PID=%PID%\r\n"
+                    ":wait\r\n"
+                    ">>\"%LOG%\" echo [%%DATE%% %%TIME%%] Waiting process PID=%PID% to exit...\r\n"
+                    ">nul 2>&1 tasklist /fi \"pid eq %PID%\" | find \"%PID%\" && ( timeout /t 1 /nobreak >nul & goto wait )\r\n"
+                    ">>\"%LOG%\" echo [%%DATE%% %%TIME%%] Process exited, replacing file...\r\n"
+                    ":copyloop\r\n"
+                    "copy /y \"%NEW%\" \"%TARGET%\" >>\"%LOG%\" 2>&1\r\n"
+                    "if errorlevel 1 ( >>\"%LOG%\" echo [%%DATE%% %%TIME%%] copy failed, retry... & timeout /t 1 >nul & goto copyloop )\r\n"
+                    ">>\"%LOG%\" echo [%%DATE%% %%TIME%%] Starting new binary...\r\n"
+                    "start \"\" /D \"%~dp2\" \"%TARGET%\"\r\n"
+                    ">>\"%LOG%\" echo [%%DATE%% %%TIME%%] Cleanup...\r\n"
+                    "del /q \"%NEW%\" >nul 2>&1\r\n"
+                    "del /q \"%SELF%\" >nul 2>&1\r\n"
+                    "endlocal\r\n"
+                    "exit\r\n"
+                )
+                tmp_bat.write_text(bat_script, encoding="utf-8")
+                log.info(f"[update] Updater script: {tmp_bat}")
+                creationflags = getattr(subprocess, 'CREATE_NO_WINDOW', 0) | getattr(subprocess, 'DETACHED_PROCESS', 0)
+                pid = os.getpid()
+                log_dir = exe.parent / "logs"
+                subprocess.Popen(["cmd", "/c", str(tmp_bat), str(new_file), str(exe), str(pid), str(log_dir)], creationflags=creationflags)
+                return True
+            except Exception as e:
+                log.error(f"[update] Install (Windows) failed: {e}")
+                return False
+        try:
+            subprocess.Popen([str(new_file)])
+            return True
+        except Exception as e:
+            log.error(f"[update] Install (non-frozen) failed: {e}")
+            return False
