@@ -1,10 +1,10 @@
 {
-  "version": "1.0.13",
-  "notes": "PowerShell updater: Wait-Process, надёжная замена с ретраями, старт скрытно из папки exe.",
+  "version": "1.0.14",
+  "notes": "Updater (PowerShell): Wait-Process, подтверждение старта (-PassThru), fallback через cmd /c start, расширенное логирование.",
   "assets": {
     "windows": {
-      "url": "https://github.com/worryeed/ClubSender/releases/download/v1.0.13/ClubSender.exe",
-      "sha256": "300FE65E22EC4CB841482B1B3E57B1A444568AEC8FA9837179717B4965FDE5A4"
+      "url": "https://github.com/worryeed/ClubSender/releases/download/v1.0.14/ClubSender.exe",
+      "sha256": "2750ACB0D9EF7697DC2B8CCB9DF97049C290DE6286E252C80C4C2E0732C37F44"
     }
   }
 }
