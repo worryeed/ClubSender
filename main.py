@@ -1845,3 +1845,6 @@ def main():
         print("[StartupError]", e, file=sys.stderr)
         print(tb, file=sys.stderr)
 
+if __name__ == "__main__":
+    main()
+
