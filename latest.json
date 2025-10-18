@@ -1,0 +1,6 @@
+{
+  "app_name": "ClubSender",
+  "channels": ["stable"],
+  "current": "1.0.0",
+  "notes": "Initial public release"
+}
