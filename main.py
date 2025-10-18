@@ -1115,11 +1115,7 @@ class MainWindow(QMainWindow):
                 QMessageBox.information(self, "Обновление", f"Обновлений нет (версия {__version__})")
                 return
             new_ver = getattr(upd, 'version', 'new')
-            if QMessageBox.question(
-                self, "Обновление доступно",
-                f"Найдена версия {new_ver}. Скачать?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-            ) != QMessageBox.StandardButton.Yes:
+            if not self._ask_yes_no("Обновление доступно", f"Найдена версия {new_ver}. Скачать?"):
                 return
             self._start_update_download(mgr, str(new_ver))
         except Exception as e:
@@ -1133,11 +1129,7 @@ class MainWindow(QMainWindow):
             upd = mgr.check_for_update()
             if upd:
                 new_ver = getattr(upd, 'version', 'new')
-                if QMessageBox.question(
-                    self, "Доступно обновление",
-                    f"Найдена версия {new_ver}. Скачать сейчас?",
-                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-                ) == QMessageBox.StandardButton.Yes:
+                if self._ask_yes_no("Доступно обновление", f"Найдена версия {new_ver}. Скачать сейчас?"):
                     self._start_update_download(mgr, str(new_ver))
         except Exception:
             pass
@@ -1173,6 +1165,16 @@ class MainWindow(QMainWindow):
         th.finished.connect(_done)
         th.start()
         dlg.show()
+
+    def _ask_yes_no(self, title: str, text: str) -> bool:
+        box = QMessageBox(self)
+        box.setWindowTitle(title)
+        box.setText(text)
+        yes = box.addButton("Да", QMessageBox.ButtonRole.YesRole)
+        no = box.addButton("Нет", QMessageBox.ButtonRole.NoRole)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.exec()
+        return box.clickedButton() is yes
 
     def on_export_report(self):
         if not self.report_rows:
