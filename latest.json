@@ -1,6 +1,10 @@
 {
-  "app_name": "ClubSender",
-  "channels": ["stable"],
-  "current": "1.0.0",
-  "notes": "Initial public release"
+  "version": "1.0.1",
+  "notes": "UI: кнопка обновления и показ версии; кастомный автообновлятор.",
+  "assets": {
+    "windows": {
+      "url": "https://github.com/worryeed/ClubSender/releases/download/v1.0.1/ClubSender.exe",
+      "sha256": "0446F6985603CAF4B8BDBE105C6B9A864586971B0F3159953D615B9872BFF160"
+    }
+  }
 }
