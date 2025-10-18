@@ -1,10 +1,10 @@
 {
-  "version": "1.0.3",
-  "notes": "Технический релиз: версия повышена до 1.0.3 для проверки автообновления.",
+  "version": "1.0.4",
+  "notes": "Исправлен авто‑перезапуск и добавлено логирование обновления.",
   "assets": {
     "windows": {
-      "url": "https://github.com/worryeed/ClubSender/releases/download/v1.0.3/ClubSender.exe",
-      "sha256": "D79575F8AD1C885B4E44C1081A033BCE0E2242B4D919CB23600337B2EE1C9E17"
+      "url": "https://github.com/worryeed/ClubSender/releases/download/v1.0.4/ClubSender.exe",
+      "sha256": "4A6CC80852EB5640FDE9481377138268F527ACE1EA5AA2A5446C2E7CB577BE8B"
     }
   }
 }
