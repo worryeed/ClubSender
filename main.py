@@ -6,7 +6,7 @@ from logging.handlers import RotatingFileHandler
 from typing import List, Optional, Dict, Set
 from dataclasses import dataclass
 from PyQt6 import QtCore, QtWidgets
-from PyQt6.QtCore import Qt, pyqtSignal, QThread
+from PyQt6.QtCore import Qt, pyqtSignal, QThread, QTimer
 from PyQt6.QtGui import QPalette, QColor
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QFileDialog, QTableWidget, QTableWidgetItem, QHeaderView,
@@ -1157,16 +1157,19 @@ class MainWindow(QMainWindow):
         th.progress.connect(lambda p: (bar.setValue(int(p)), self.log.appendPlainText(f"{Icons.INFO} Загрузка обновления: {int(p)}%")))
         def _done(ok: bool, err: str):
             try:
-                dlg.close()
+                try:
+                    dlg.close()
+                except Exception:
+                    pass
+                if ok:
+                    self.log.appendPlainText(f"{Icons.SUCCESS} Обновление скачано и установка запущена. Перезапуск...")
+                    # Дадим апдейтеру стартануть, затем завершим приложение
+                    QTimer.singleShot(200, lambda: QApplication.instance().quit())
+                else:
+                    self.log.appendPlainText(f"{Icons.ERROR} Обновление: ошибка загрузки/установки ({err or 'unknown'})")
+                    QMessageBox.critical(self, "Обновление", "Ошибка загрузки/установки")
             except Exception:
-                pass
-            if ok:
-                self.log.appendPlainText(f"{Icons.SUCCESS} Обновление скачано и установка запущена. Перезапуск...")
-                # Дадим апдейтеру стартануть, затем завершим приложение
-                QTimer.singleShot(200, lambda: QApplication.instance().quit())
-            else:
-                self.log.appendPlainText(f"{Icons.ERROR} Обновление: ошибка загрузки/установки ({err or 'unknown'})")
-                QMessageBox.critical(self, "Обновление", "Ошибка загрузки/установки")
+                logging.getLogger(__name__).exception("[update] _done callback error")
         th.finished.connect(_done)
         th.start()
         dlg.show()
@@ -1844,6 +1847,31 @@ class MainWindow(QMainWindow):
         self.save_settings()
 
 
+def _configure_console():
+    try:
+        if os.name != 'nt':
+            return
+        import ctypes
+        SW_HIDE, SW_SHOW = 0, 5
+        GetConsoleWindow = ctypes.windll.kernel32.GetConsoleWindow
+        ShowWindow = ctypes.windll.user32.ShowWindow
+        hwnd = GetConsoleWindow()
+        want_console = any(a in ('--console', '-c', '/c') for a in sys.argv[1:])
+        if want_console:
+            if hwnd:
+                ShowWindow(hwnd, SW_SHOW)
+            else:
+                try:
+                    ctypes.windll.kernel32.AllocConsole()
+                except Exception:
+                    pass
+        else:
+            if hwnd:
+                ShowWindow(hwnd, SW_HIDE)
+    except Exception:
+        pass
+
+
 def main():
     """Старт GUI с расширенной диагностикой стартовых ошибок."""
     try:
@@ -1864,6 +1892,8 @@ def main():
             ]
         )
         logging.getLogger(__name__).info("Starting ClubSender GUI...")
+        # Console: hidden by default; use --console to show
+        _configure_console()
         app = QApplication(sys.argv)
         w = MainWindow()
         w.show()
