@@ -36,6 +36,7 @@ except Exception:
         _qdt_api = None
 
 from core import Account, JoinResult, XPokerAPI, ApiError
+from core.version import __version__
 from core.messages import Icons, format_login_step, format_join_result, MESSAGES
 
 APP_TITLE = "Little Pony Games API Manager"
@@ -726,11 +727,11 @@ class MainWindow(QMainWindow):
         self.btn_update = QPushButton("🔄 Обновить")
         self.btn_update.setMaximumWidth(150)
         status_layout.addWidget(self.btn_update)
+        # Получаем версию из переменной которую должны импортировать в начале
         try:
-            from core.version import __version__
             version_text = f"v{__version__}"
-        except:
-            version_text = "v1.0.0"
+        except NameError:
+            version_text = "v1.0.19"
         self.version_label = QLabel(version_text)
         self.version_label.setStyleSheet("color: #888; font-size: 10px; margin-right: 10px;")
         status_layout.addWidget(self.version_label)
@@ -789,7 +790,6 @@ class MainWindow(QMainWindow):
         """Проверить доступность обновления."""
         try:
             from update.manager import UpdateManager
-            from core.version import __version__
             
             manager = UpdateManager()
             latest_info = manager.check_for_update()
