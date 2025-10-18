@@ -37,6 +37,8 @@ except Exception:
 
 from core import Account, JoinResult, XPokerAPI, ApiError
 from core.messages import Icons, format_login_step, format_join_result, MESSAGES
+from core.version import __version__
+from update.updater import UpdateManager
 
 APP_TITLE = "Little Pony Games API Manager"
 ACCOUNTS_COLUMNS = ["Имя пользователя", "Пароль", "Прокси", "ID устройства", "Токен (кратко)", "Последний вход"]
@@ -656,6 +658,7 @@ class MainWindow(QMainWindow):
         self.btn_pause.setEnabled(False)
         self.btn_stop = QPushButton("🛑 Остановить")
         self.btn_export = QPushButton("📊 Экспорт отчета")
+        self.btn_check_update = QPushButton("⬆️ Проверить обновление")
         
         # Изначально кнопка остановки неактивна
         self.btn_stop.setEnabled(False)
@@ -666,6 +669,7 @@ class MainWindow(QMainWindow):
         operations_layout.addWidget(self.btn_pause)
         operations_layout.addWidget(self.btn_stop)
         operations_layout.addWidget(self.btn_export)
+        operations_layout.addWidget(self.btn_check_update)
         # Тема (светлая/тёмная/системная)
         operations_layout.addWidget(QLabel("Тема:"))
         self.cmb_theme = QComboBox()
@@ -738,6 +742,7 @@ class MainWindow(QMainWindow):
         self.btn_pause.clicked.connect(self.on_pause)
         self.btn_stop.clicked.connect(self.on_stop)
         self.btn_export.clicked.connect(self.on_export_report)
+        self.btn_check_update.clicked.connect(self.on_check_update)
         self.cmb_theme.currentIndexChanged.connect(self.on_theme_combo_changed)
 
         self.worker = Worker(self.accounts)
@@ -763,6 +768,11 @@ class MainWindow(QMainWindow):
         self.current_theme_mode = 'light'  # эффективная ('light'|'dark')
         # Загружаем сохранённые настройки
         self.load_settings()
+        # Автопроверка обновлений при старте (не блокирует задачи)
+        try:
+            QtCore.QTimer.singleShot(2000, lambda: self.check_update_silent())
+        except Exception:
+            pass
         # Применим текущую настройку/системную по умолчанию
         self.apply_theme(self.theme_pref)
 
@@ -1757,6 +1767,62 @@ def main():
     w = MainWindow()
     w.show()
     sys.exit(app.exec())
+
+    def on_check_update(self):
+        try:
+            if self.worker.isRunning():
+                QMessageBox.information(self, "Занято", "Сначала дождитесь завершения текущей задачи")
+                return
+            mgr = UpdateManager(__version__)
+            upd = mgr.check_for_update()
+            if not upd:
+                QMessageBox.information(self, "Обновление", f"Обновлений нет (версия {__version__})")
+                return
+            # Есть обновление — спросим скачать
+            new_ver = getattr(upd, 'version', 'new')
+            reply = QMessageBox.question(
+                self, "Обновление доступно",
+                f"Найдена версия {new_ver}. Скачать?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+            # Скачиваем с простым прогрессом в логе
+            self.log.appendPlainText(f"{Icons.INFO} Загрузка обновления {new_ver}...")
+            def _prog(pct: int):
+                try:
+                    self.log.appendPlainText(f"{Icons.INFO} Загрузка: {pct}%")
+                except Exception:
+                    pass
+            ok = mgr.download(progress_cb=_prog)
+            if not ok:
+                QMessageBox.critical(self, "Обновление", "Не удалось скачать обновление")
+                return
+            # Устанавливаем (для упакованной версии возможен автоперезапуск)
+            installed = mgr.install()
+            if installed:
+                QMessageBox.information(self, "Обновление", "Обновление готово. Перезапустите приложение, если оно не перезапустилось автоматически.")
+            else:
+                QMessageBox.critical(self, "Обновление", "Не удалось установить обновление")
+        except Exception as e:
+            QMessageBox.critical(self, "Ошибка обновления", str(e))
+
+    def check_update_silent(self):
+        try:
+            mgr = UpdateManager(__version__)
+            upd = mgr.check_for_update()
+            if upd:
+                new_ver = getattr(upd, 'version', 'new')
+                # Ненавязчивое уведомление с предложением скачать
+                reply = QMessageBox.question(
+                    self, "Доступно обновление",
+                    f"Найдена версия {new_ver}. Скачать сейчас?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                )
+                if reply == QMessageBox.StandardButton.Yes:
+                    self.on_check_update()
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     main()
