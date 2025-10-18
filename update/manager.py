@@ -165,42 +165,33 @@ class UpdateManager:
         # If running from PyInstaller onefile
         if getattr(sys, "frozen", False) and exe.suffix.lower() == ".exe":
             try:
-                tmp_bat = Path(tempfile.gettempdir()) / f"clubsender_update_{int(time.time())}.bat"
-                bat_script = (
-                    "@echo off\r\n"
-                    "setlocal enableextensions\r\n"
-                    "set \"NEW=%~1\"\r\n"
-                    "set \"TARGET=%~2\"\r\n"
-                    "set \"PID=%~3\"\r\n"
-                    "set \"LOGDIR=%~4\"\r\n"
-                    "set \"SELF=%~f0\"\r\n"
-                    "if not exist \"%LOGDIR%\" mkdir \"%LOGDIR%\"\r\n"
-                    "set \"LOG=%LOGDIR%\\updater.log\"\r\n"
-                    ">>\"%LOG%\" echo [%DATE% %TIME%] Updater start. NEW=\"%NEW%\" TARGET=\"%TARGET%\" PID=%PID%\r\n"
-                    ":wait\r\n"
-                    ">>\"%LOG%\" echo [%DATE% %TIME%] Waiting PID=%PID%...\r\n"
-                    "set PROC=\r\n"
-                    "for /f \"tokens=2 delims=,\" %%%%A in ('tasklist /fi \"pid eq %PID%\" /fo csv /nh') do set PROC=%%%%~A\r\n"
-                    "if defined PROC ( set PROC= & timeout /t 1 /nobreak >nul & goto wait )\r\n"
-                    ">>\"%LOG%\" echo [%DATE% %TIME%] Process exited, replacing file...\r\n"
-                    ":copyloop\r\n"
-                    "copy /y \"%NEW%\" \"%TARGET%\" >>\"%LOG%\" 2>&1\r\n"
-                    "if errorlevel 1 ( >>\"%LOG%\" echo [%DATE% %TIME%] copy failed, retry... & timeout /t 1 >nul & goto copyloop )\r\n"
-                    ">>\"%LOG%\" echo [%DATE% %TIME%] Starting new binary...\r\n"
-                    "start \"\" /B /D \"%~dp2\" \"%TARGET%\"\r\n"
-                    ">>\"%LOG%\" echo [%DATE% %TIME%] Cleanup...\r\n"
-                    "del /q \"%NEW%\" >nul 2>&1\r\n"
-                    "del /q \"%SELF%\" >nul 2>&1\r\n"
-                    "endlocal\r\n"
-                    "exit\r\n"
-                )
-                tmp_bat.write_text(bat_script, encoding="utf-8")
-                log.info(f"[update] Updater script: {tmp_bat}")
-                # Launch batch to swap and restart hidden
+                tmp_ps1 = Path(tempfile.gettempdir()) / f"clubsender_update_{int(time.time())}.ps1"
+                ps_script = """
+param([string]$New,[string]$Target,[int]$Pid,[string]$LogDir)
+$ErrorActionPreference='SilentlyContinue'
+if(!(Test-Path -LiteralPath $LogDir)){New-Item -ItemType Directory -Force -Path $LogDir | Out-Null}
+$Log = Join-Path $LogDir 'updater.log'
+function Log($m){ Add-Content -Path $Log -Value ("[{0}] {1}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'), $m) }
+Log ("Start. NEW=\"{0}\" TARGET=\"{1}\" PID={2}" -f $New,$Target,$Pid)
+if($Pid -gt 0){ try{ Wait-Process -Id $Pid -ErrorAction SilentlyContinue } catch{} }
+Log 'Replacing target...'
+$ok=$false; for($i=0;$i -lt 60 -and -not $ok;$i++){ try{ Copy-Item -Force -LiteralPath $New -Destination $Target; $ok=$true } catch{ Start-Sleep -Seconds 1 } }
+Log 'Starting new binary...'
+$wd = Split-Path -Parent $Target
+Start-Process -FilePath $Target -WorkingDirectory $wd -WindowStyle Hidden | Out-Null
+try{ Remove-Item -LiteralPath $New -Force } catch{}
+try{ Remove-Item -LiteralPath $PSCommandPath -Force } catch{}
+""".strip()
+                tmp_ps1.write_text(ps_script, encoding="utf-8")
+                log.info(f"[update] Updater script: {tmp_ps1}")
+                # Launch PowerShell updater hidden
                 creationflags = getattr(subprocess, 'CREATE_NO_WINDOW', 0) | getattr(subprocess, 'DETACHED_PROCESS', 0)
                 pid = os.getpid()
                 log_dir = exe.parent / "logs"
-                subprocess.Popen(["cmd", "/c", str(tmp_bat), str(new_file), str(exe), str(pid), str(log_dir)], creationflags=creationflags)
+                subprocess.Popen([
+                    "powershell","-NoProfile","-ExecutionPolicy","Bypass","-File",str(tmp_ps1),
+                    str(new_file),str(exe),str(pid),str(log_dir)
+                ], creationflags=creationflags)
                 return True
             except Exception as e:
                 log.error(f"[update] Install (Windows) failed: {e}")
