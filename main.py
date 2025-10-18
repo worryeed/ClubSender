@@ -617,7 +617,7 @@ class UpdateDownloadThread(QThread):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle(APP_TITLE)
+        self.setWindowTitle(f"{APP_TITLE} v{__version__}")
         self.resize(1200, 760)
 
         self.accounts: List[Account] = []
