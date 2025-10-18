@@ -1,10 +1,10 @@
 {
-  "version": "1.0.6",
-  "notes": "Исправление NameError(QTimer) при автообновлении; лог ошибок колбэка; флаг --console (по умолчанию консоль скрыта).",
+  "version": "1.0.7",
+  "notes": "Технический релиз: версия 1.0.7 (без изменений функционала).",
   "assets": {
     "windows": {
-      "url": "https://github.com/worryeed/ClubSender/releases/download/v1.0.6/ClubSender.exe",
-      "sha256": "D9E1A14AE35AC180B735EBF064068513050CE45EE6E8CBBE1EA68D94B48ABE8A"
+      "url": "https://github.com/worryeed/ClubSender/releases/download/v1.0.7/ClubSender.exe",
+      "sha256": "C05F918F76967E6E256D1C0EE600E513A55A0D34A67E2B5FA90B9D8171B34789"
     }
   }
 }
