@@ -1154,16 +1154,18 @@ class MainWindow(QMainWindow):
         self._upd_dialog = dlg
         th = UpdateDownloadThread(mgr, self)
         self._upd_thread = th
-        th.progress.connect(lambda p: bar.setValue(int(p)))
+        th.progress.connect(lambda p: (bar.setValue(int(p)), self.log.appendPlainText(f"{Icons.INFO} Загрузка обновления: {int(p)}%")))
         def _done(ok: bool, err: str):
             try:
                 dlg.close()
             except Exception:
                 pass
             if ok:
-                # Приложение завершится; батник заменит exe и перезапустит
-                QApplication.instance().quit()
+                self.log.appendPlainText(f"{Icons.SUCCESS} Обновление скачано и установка запущена. Перезапуск...")
+                # Дадим апдейтеру стартануть, затем завершим приложение
+                QTimer.singleShot(200, lambda: QApplication.instance().quit())
             else:
+                self.log.appendPlainText(f"{Icons.ERROR} Обновление: ошибка загрузки/установки ({err or 'unknown'})")
                 QMessageBox.critical(self, "Обновление", "Ошибка загрузки/установки")
         th.finished.connect(_done)
         th.start()

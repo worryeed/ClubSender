@@ -5,11 +5,14 @@ import json
 import hashlib
 import tempfile
 import subprocess
+import time
+import logging
 from pathlib import Path
 from typing import Optional, Callable, Dict, Any
 
 import requests
 
+log = logging.getLogger(__name__)
 DEFAULT_MANIFEST_URL = "https://worryeed.github.io/ClubSender/latest.json"
 
 
@@ -54,10 +57,14 @@ class UpdateManager:
 
     def _fetch_manifest(self) -> Optional[Dict[str, Any]]:
         try:
+            log.info(f"[update] Fetch manifest: {self.manifest_url}")
             r = requests.get(self.manifest_url, timeout=10)
             r.raise_for_status()
-            return r.json()
-        except Exception:
+            m = r.json()
+            log.info(f"[update] Manifest received: keys={list(m.keys())}")
+            return m
+        except Exception as e:
+            log.error(f"[update] Manifest fetch failed: {e}")
             return None
 
     def _select_asset(self, manifest: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -82,9 +89,11 @@ class UpdateManager:
             return None
         sel = self._select_asset(m)
         if not sel:
+            log.warning("[update] No suitable asset in manifest")
             return None
         cur = _semver_tuple(self.current_version)
         lat = _semver_tuple(sel["version"])
+        log.info(f"[update] Current={self.current_version} Latest={sel['version']} -> need_update={lat>cur}")
         if lat > cur:
             self._update_info = sel
             return sel
@@ -102,10 +111,11 @@ class UpdateManager:
             return False
         url = self._update_info["url"]
         try:
+            log.info(f"[update] Download start: {url}")
             with requests.get(url, stream=True, timeout=30) as r:
                 r.raise_for_status()
                 total = int(r.headers.get("content-length", 0))
-                fd, tmp = tempfile.mkstemp(prefix="clubsender_update_")
+                fd, tmp = tempfile.mkstemp(prefix="clubsender_update_", suffix=".bin")
                 os.close(fd)
                 p = Path(tmp)
                 downloaded = 0
@@ -116,21 +126,25 @@ class UpdateManager:
                         f.write(chunk)
                         downloaded += len(chunk)
                         if progress_cb and total > 0:
-                            pct = int(downloaded * 100 / total)
+                            pct = max(0, min(100, int(downloaded * 100 / total)))
                             progress_cb(pct)
                 # verify sha256 if provided
                 expect = (self._update_info.get("sha256") or "").lower().strip()
                 if expect:
                     actual = self._sha256(p)
+                    log.info(f"[update] SHA256 actual={actual} expect={expect}")
                     if actual.lower() != expect:
                         try:
                             p.unlink(missing_ok=True)  # type: ignore[arg-type]
                         except Exception:
                             pass
+                        log.error("[update] Hash mismatch, abort")
                         return False
                 self._downloaded_path = p
+                log.info(f"[update] Download complete: {p}")
                 return True
-        except Exception:
+        except Exception as e:
+            log.error(f"[update] Download failed: {e}")
             return False
 
     def install(self) -> bool:
@@ -150,34 +164,39 @@ class UpdateManager:
         exe = Path(sys.executable)
         # If running from PyInstaller onefile
         if getattr(sys, "frozen", False) and exe.suffix.lower() == ".exe":
-            # Create inline updater .bat to replace exe after exit
             try:
-                bat = exe.with_suffix(".update.bat")
-                bat.write_text(
-                    """
-@echo off
-setlocal enableextensions
-set NEW=%1
-set TARGET=%2
-:waitloop
-timeout /t 1 /nobreak >nul
-(del /f /q "%TARGET%") >nul 2>&1
-if exist "%TARGET%" goto waitloop
-move /y "%NEW%" "%TARGET%" >nul 2>&1
-start "" "%TARGET%"
-endlocal
-exit
-""".strip(),
-                    encoding="utf-8",
+                tmp_bat = Path(tempfile.gettempdir()) / f"clubsender_update_{int(time.time())}.bat"
+                bat_script = (
+                    "@echo off\r\n"
+                    "setlocal enableextensions\r\n"
+                    "set \"NEW=%~1\"\r\n"
+                    "set \"TARGET=%~2\"\r\n"
+                    "set \"SELF=%~f0\"\r\n"
+                    ":wait\r\n"
+                    ">nul 2>&1 tasklist /fi \"imagename eq %~nx2\" | find /i \"%~nx2\" >nul\r\n"
+                    "if %errorlevel%==0 ( timeout /t 1 /nobreak >nul & goto wait )\r\n"
+                    ":copyloop\r\n"
+                    "copy /y \"%NEW%\" \"%TARGET%\" >nul 2>&1\r\n"
+                    "if errorlevel 1 ( timeout /t 1 >nul & goto copyloop )\r\n"
+                    "start \"\" \"%TARGET%\"\r\n"
+                    "del /q \"%NEW%\" >nul 2>&1\r\n"
+                    "del /q \"%SELF%\" >nul 2>&1\r\n"
+                    "endlocal\r\n"
+                    "exit\r\n"
                 )
-                # Launch batch to swap and restart; pass quoted paths
-                subprocess.Popen(["cmd", "/c", str(bat), str(new_file), str(exe)])
+                tmp_bat.write_text(bat_script, encoding="utf-8")
+                log.info(f"[update] Updater script: {tmp_bat}")
+                # Launch batch to swap and restart hidden
+                creationflags = getattr(subprocess, 'CREATE_NO_WINDOW', 0) | getattr(subprocess, 'DETACHED_PROCESS', 0)
+                subprocess.Popen(["cmd", "/c", str(tmp_bat), str(new_file), str(exe)], creationflags=creationflags)
                 return True
-            except Exception:
+            except Exception as e:
+                log.error(f"[update] Install (Windows) failed: {e}")
                 return False
         # Not frozen: just launch the downloaded binary/installer
         try:
             subprocess.Popen([str(new_file)])
             return True
-        except Exception:
+        except Exception as e:
+            log.error(f"[update] Install (non-frozen) failed: {e}")
             return False
