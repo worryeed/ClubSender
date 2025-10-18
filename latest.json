@@ -1,10 +1,10 @@
 {
-  "version": "1.0.15",
-  "notes": "Окно консоли скрыто по умолчанию (windowed); для отладки используйте флаг --console. Функциональных изменений нет относительно 1.0.14.",
+  "version": "1.0.16",
+  "notes": "Исправлен апдейтер: используется BAT, без ошибок PowerShell. Консоль скрыта по умолчанию; для отладки используйте --console.",
   "assets": {
     "windows": {
-      "url": "https://github.com/worryeed/ClubSender/releases/download/v1.0.15/ClubSender.exe",
-      "sha256": "FC7D9FA2FFBB1F2410899EAC9A9956CAA003A71FB7EE0AA96A52FE7DBFB32B46"
+      "url": "https://github.com/worryeed/ClubSender/releases/download/v1.0.16/ClubSender.exe",
+      "sha256": "85C94ADE3996174B1A8DF4A2BFF70CE93FF95C2854DB61DEF1B90562DDC9C70C"
     }
   }
 }
