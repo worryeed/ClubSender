@@ -1811,24 +1811,37 @@ class MainWindow(QMainWindow):
 
 
 def main():
-    # Configure detailed logging to see all operations
-    # Ensure files/logs directories exist
+    """Старт GUI с расширенной диагностикой стартовых ошибок."""
     try:
-        Path('files').mkdir(parents=True, exist_ok=True)
-        Path('logs').mkdir(parents=True, exist_ok=True)
-    except Exception:
-        pass
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(levelname)s - [%(name)s] - %(message)s',
-        handlers=[
-            RotatingFileHandler(str(Path('logs')/'xpoker_gui.log'), maxBytes=2*1024*1024, backupCount=5, encoding='utf-8'),
-            logging.StreamHandler()
-        ]
-    )
-    
-    app = QApplication(sys.argv)
-    w = MainWindow()
-    w.show()
-    sys.exit(app.exec())
+        # Для отладки проблем с Qt-плагинами раскомментируйте:
+        # os.environ.setdefault("QT_DEBUG_PLUGINS", "1")
+        # Ensure files/logs directories exist
+        try:
+            Path('files').mkdir(parents=True, exist_ok=True)
+            Path('logs').mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - [%(name)s] - %(message)s',
+            handlers=[
+                RotatingFileHandler(str(Path('logs')/'xpoker_gui.log'), maxBytes=2*1024*1024, backupCount=5, encoding='utf-8'),
+                logging.StreamHandler()
+            ]
+        )
+        logging.getLogger(__name__).info("Starting ClubSender GUI...")
+        app = QApplication(sys.argv)
+        w = MainWindow()
+        w.show()
+        sys.exit(app.exec())
+    except Exception as e:
+        tb = traceback.format_exc()
+        try:
+            Path('logs').mkdir(parents=True, exist_ok=True)
+            with open(Path('logs')/"startup_error.log", 'w', encoding='utf-8') as f:
+                f.write(tb)
+        except Exception:
+            pass
+        print("[StartupError]", e, file=sys.stderr)
+        print(tb, file=sys.stderr)
 
