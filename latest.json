@@ -1,10 +1,10 @@
 {
-  "version": "1.0.14",
-  "notes": "Updater (PowerShell): Wait-Process, подтверждение старта (-PassThru), fallback через cmd /c start, расширенное логирование.",
+  "version": "1.0.15",
+  "notes": "Окно консоли скрыто по умолчанию (windowed); для отладки используйте флаг --console. Функциональных изменений нет относительно 1.0.14.",
   "assets": {
     "windows": {
-      "url": "https://github.com/worryeed/ClubSender/releases/download/v1.0.14/ClubSender.exe",
-      "sha256": "2750ACB0D9EF7697DC2B8CCB9DF97049C290DE6286E252C80C4C2E0732C37F44"
+      "url": "https://github.com/worryeed/ClubSender/releases/download/v1.0.15/ClubSender.exe",
+      "sha256": "FC7D9FA2FFBB1F2410899EAC9A9956CAA003A71FB7EE0AA96A52FE7DBFB32B46"
     }
   }
 }
