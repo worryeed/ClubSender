@@ -597,6 +597,23 @@ class DebugTCPDialog(QDialog):
         if self.validate():
             super().accept()
 
+class UpdateDownloadThread(QThread):
+    progress = pyqtSignal(int)
+    finished = pyqtSignal(bool, str)
+
+    def __init__(self, mgr: UpdateManager, parent=None):
+        super().__init__(parent)
+        self.mgr = mgr
+
+    def run(self):
+        ok = self.mgr.download(progress_cb=lambda p: self.progress.emit(int(p)))
+        if ok:
+            installed = self.mgr.install()
+            self.finished.emit(bool(installed), "")
+        else:
+            self.finished.emit(False, "download_failed")
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -658,7 +675,7 @@ class MainWindow(QMainWindow):
         self.btn_pause.setEnabled(False)
         self.btn_stop = QPushButton("🛑 Остановить")
         self.btn_export = QPushButton("📊 Экспорт отчета")
-        self.btn_check_update = QPushButton("⬆️ Проверить обновление")
+        self.btn_check_update = QPushButton("🔄 Проверить обновление")
         
         # Изначально кнопка остановки неактивна
         self.btn_stop.setEnabled(False)
@@ -745,6 +762,10 @@ class MainWindow(QMainWindow):
         self.btn_check_update.clicked.connect(self.on_check_update)
         self.cmb_theme.currentIndexChanged.connect(self.on_theme_combo_changed)
 
+        # Элементы обновлений
+        self._upd_thread: Optional[UpdateDownloadThread] = None
+        self._upd_dialog: Optional[QDialog] = None
+        
         self.worker = Worker(self.accounts)
         self.worker.log.connect(self.on_worker_log)
         self.worker.account_updated.connect(self.on_account_updated)
@@ -1084,38 +1105,23 @@ class MainWindow(QMainWindow):
         if UpdateManager is None:
             QMessageBox.information(self, "Обновление", "Модуль обновления не установлен")
             return
+        if self.worker.isRunning():
+            QMessageBox.information(self, "Занято", "Сначала дождитесь завершения текущей задачи")
+            return
         try:
-            if self.worker.isRunning():
-                QMessageBox.information(self, "Занято", "Сначала дождитесь завершения текущей задачи")
-                return
             mgr = UpdateManager(__version__)
             upd = mgr.check_for_update()
             if not upd:
                 QMessageBox.information(self, "Обновление", f"Обновлений нет (версия {__version__})")
                 return
             new_ver = getattr(upd, 'version', 'new')
-            reply = QMessageBox.question(
+            if QMessageBox.question(
                 self, "Обновление доступно",
                 f"Найдена версия {new_ver}. Скачать?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-            )
-            if reply != QMessageBox.StandardButton.Yes:
+            ) != QMessageBox.StandardButton.Yes:
                 return
-            self.log.appendPlainText(f"{Icons.INFO} Загрузка обновления {new_ver}...")
-            def _prog(pct: int):
-                try:
-                    self.log.appendPlainText(f"{Icons.INFO} Загрузка: {pct}%")
-                except Exception:
-                    pass
-            ok = mgr.download(progress_cb=_prog)
-            if not ok:
-                QMessageBox.critical(self, "Обновление", "Не удалось скачать обновление")
-                return
-            installed = mgr.install()
-            if installed:
-                QMessageBox.information(self, "Обновление", "Обновление готово. Перезапустите приложение, если оно не перезапустилось автоматически.")
-            else:
-                QMessageBox.critical(self, "Обновление", "Не удалось установить обновление")
+            self._start_update_download(mgr, str(new_ver))
         except Exception as e:
             QMessageBox.critical(self, "Ошибка обновления", str(e))
 
@@ -1127,15 +1133,41 @@ class MainWindow(QMainWindow):
             upd = mgr.check_for_update()
             if upd:
                 new_ver = getattr(upd, 'version', 'new')
-                reply = QMessageBox.question(
+                if QMessageBox.question(
                     self, "Доступно обновление",
                     f"Найдена версия {new_ver}. Скачать сейчас?",
                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-                )
-                if reply == QMessageBox.StandardButton.Yes:
-                    self.on_check_update()
+                ) == QMessageBox.StandardButton.Yes:
+                    self._start_update_download(mgr, str(new_ver))
         except Exception:
             pass
+
+    def _start_update_download(self, mgr: UpdateManager, new_ver: str):
+        # Диалог прогресса, не блокирует UI полностью
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"Загрузка обновления {new_ver}")
+        lay = QVBoxLayout(dlg)
+        lbl = QLabel(f"Скачивание {new_ver}...")
+        bar = QProgressBar(dlg)
+        bar.setRange(0, 100); bar.setValue(0)
+        lay.addWidget(lbl); lay.addWidget(bar)
+        self._upd_dialog = dlg
+        th = UpdateDownloadThread(mgr, self)
+        self._upd_thread = th
+        th.progress.connect(lambda p: bar.setValue(int(p)))
+        def _done(ok: bool, err: str):
+            try:
+                dlg.close()
+            except Exception:
+                pass
+            if ok:
+                # Приложение завершится; батник заменит exe и перезапустит
+                QApplication.instance().quit()
+            else:
+                QMessageBox.critical(self, "Обновление", "Ошибка загрузки/установки")
+        th.finished.connect(_done)
+        th.start()
+        dlg.show()
 
     def on_export_report(self):
         if not self.report_rows:
