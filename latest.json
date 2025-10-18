@@ -1,10 +1,10 @@
 {
-  "version": "1.0.10",
-  "notes": "Updater: ожидание PID без find (CSV tasklist), запуск /B из папки exe, логи в logs/updater.log. Диалоги: кнопки Да/Нет.",
+  "version": "1.0.11",
+  "notes": "Технический релиз: версия 1.0.11 (без изменений функционала).",
   "assets": {
     "windows": {
-      "url": "https://github.com/worryeed/ClubSender/releases/download/v1.0.10/ClubSender.exe",
-      "sha256": "4CAB935136B2925B0119CA911694153461C4982856E9105AA6D2D8D419911571"
+      "url": "https://github.com/worryeed/ClubSender/releases/download/v1.0.11/ClubSender.exe",
+      "sha256": "E9A7DF0A6D975F57D2AF6DCEBD0A4FABD297CD287260C7AECA5A42E0C04C93D8"
     }
   }
 }
