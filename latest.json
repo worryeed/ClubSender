@@ -1,10 +1,10 @@
 {
-  "version": "1.0.23",
-  "notes": "Версия 1.0.23: минорные улучшения над 1.0.22 (надёжность апдейтера)",
+  "version": "1.0.24",
+  "notes": "Версия 1.0.24: надёжный запуск PowerShell-апдейтера (BREAKAWAY_FROM_JOB/NEW_PROCESS_GROUP, cwd/startupinfo)",
   "assets": {
     "windows": {
-      "url": "https://github.com/worryeed/ClubSender/releases/download/v1.0.23/ClubSender.exe",
-      "sha256": "E2E5DF1F8DEB161AFE49A0B176CC8621C6E0B48324F31902C361B631F75D5A98"
+      "url": "https://github.com/worryeed/ClubSender/releases/download/v1.0.24/ClubSender.exe",
+      "sha256": "8109090CDF342AC363EE813E07A8D031EEB8B12B85C2B33F1236C0D9BB62962E"
     }
   }
 }
