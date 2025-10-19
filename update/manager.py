@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Optional, Callable, Dict, Any
 
 import requests
+import shutil
 
 log = logging.getLogger(__name__)
 DEFAULT_MANIFEST_URL = "https://worryeed.github.io/ClubSender/latest.json"
@@ -31,6 +32,23 @@ def _semver_tuple(v: str) -> tuple:
         out.append(0)
     return tuple(out[:3])
 
+
+def _find_powershell() -> Optional[str]:
+    try:
+        sysroot = os.environ.get('SystemRoot') or os.environ.get('WINDIR')
+        candidates: list[str] = []
+        if sysroot:
+            candidates.append(str(Path(sysroot) / 'System32' / 'WindowsPowerShell' / 'v1.0' / 'powershell.exe'))
+        for name in ('powershell', 'pwsh'):
+            exe_path = shutil.which(name)
+            if exe_path:
+                candidates.append(exe_path)
+        for c in candidates:
+            if c and Path(c).exists():
+                return c
+    except Exception:
+        pass
+    return None
 
 class UpdateManager:
     """Простой менеджер обновлений без PyUpdater.
@@ -198,10 +216,20 @@ class UpdateManager:
                 creationflags = getattr(subprocess, 'CREATE_NO_WINDOW', 0) | getattr(subprocess, 'DETACHED_PROCESS', 0)
                 pid = os.getpid()
                 log_dir = exe.parent / "logs"
-                subprocess.Popen([
-                    "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(tmp_ps1),
+                try:
+                    log_dir.mkdir(parents=True, exist_ok=True)
+                except Exception:
+                    pass
+                ps = _find_powershell()
+                if not ps:
+                    log.error("[update] Cannot locate PowerShell executable")
+                    return False
+                cmd = [
+                    ps, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(tmp_ps1),
                     "-New", str(new_file), "-Target", str(exe), "-ProcId", str(pid), "-LogDir", str(log_dir)
-                ], creationflags=creationflags)
+                ]
+                log.info(f"[update] Launching updater: {' '.join(map(str, cmd))}")
+                subprocess.Popen(cmd, creationflags=creationflags)
                 return True
             except Exception as e:
                 log.error(f"[update] Install (Windows) failed: {e}")
