@@ -1,10 +1,10 @@
 {
-  "version": "1.0.36",
-  "notes": "Версия 1.0.36: schtasks основной; убран ProcId; улучшены ретраи/фолбэки; XP_UPDATER_DEBUG показывает консоль.",
+  "version": "1.0.37",
+  "notes": "Версия 1.0.37: минорный релиз.",
   "assets": {
     "windows": {
-      "url": "https://github.com/worryeed/ClubSender/releases/download/v1.0.36/ClubSender.exe",
-      "sha256": "03AA75F426669419EC10CFF26ED345B170D0C5FAB70FCED9CC30B090D0871760"
+      "url": "https://github.com/worryeed/ClubSender/releases/download/v1.0.37/ClubSender.exe",
+      "sha256": "CD786506991145C2E79B6BC7C03AFA5D862820D029FE01976A3AB6A270CAB7DC"
     }
   }
 }
