@@ -45,7 +45,7 @@ try:
 except Exception:
     __version__ = "1.0.0"
 
-APP_TITLE = "Little Pony Games API Manager"
+APP_TITLE = "ClubSender"
 ACCOUNTS_COLUMNS = ["Имя пользователя", "Пароль", "Прокси", "ID устройства", "Токен (кратко)", "Последний вход"]
 EXTRA_COLUMNS = ["Прогресс", "Статус", "Текущий клуб"]
 REPORT_COLUMNS = ["Время", "Имя пользователя", "ID клуба", "Успешно", "Сообщение"]
