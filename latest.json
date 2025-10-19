@@ -1,10 +1,10 @@
 {
-  "version": "1.0.29",
-  "notes": "Версия 1.0.29: автообновление — чистим окружение и скрываем консоль",
+  "version": "1.0.30",
+  "notes": "Версия 1.0.30: фикс установки апдейтера (cmd /c start), стабильность TCP и мелкие правки.",
   "assets": {
     "windows": {
-      "url": "https://github.com/worryeed/ClubSender/releases/download/v1.0.29/ClubSender.exe",
-      "sha256": "ADB74ABD0363E56E4682086B5D5B80B30EC3D0B3FC50AED015FC7FE22E0AEF9A"
+      "url": "https://github.com/worryeed/ClubSender/releases/download/v1.0.30/ClubSender.exe",
+      "sha256": "552E1098DFA67BFC46A2A35D491B62883DD0839DC832F4779EB7D2D49F8F88A1"
     }
   }
 }
