@@ -1,10 +1,10 @@
 {
-  "version": "1.0.25",
-  "notes": "Версия 1.0.25: улучшения стабильности автообновления (Windows PS launcher)",
+  "version": "1.0.26",
+  "notes": "Версия 1.0.26: запуск апдейтера через cmd /c start (полное отделение), fallback прямой запуск",
   "assets": {
     "windows": {
-      "url": "https://github.com/worryeed/ClubSender/releases/download/v1.0.25/ClubSender.exe",
-      "sha256": "04D0E6E3052521426AAF91DF21412EF6F93F5A52518D2F495DD52C43978AF463"
+      "url": "https://github.com/worryeed/ClubSender/releases/download/v1.0.26/ClubSender.exe",
+      "sha256": "1F4313BE8D067538586CA287C9E278B874A855F24D9CA6B1396BD1047B81D573"
     }
   }
 }
