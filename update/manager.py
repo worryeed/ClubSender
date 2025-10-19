@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Optional, Callable, Dict, Any
 
 import requests
+import shutil
 
 log = logging.getLogger(__name__)
 DEFAULT_MANIFEST_URL = "https://worryeed.github.io/ClubSender/latest.json"
@@ -29,6 +30,23 @@ def _semver_tuple(v: str) -> tuple:
         out.append(0)
     return tuple(out[:3])
 
+
+def _find_powershell() -> Optional[str]:
+    try:
+        sysroot = os.environ.get('SystemRoot') or os.environ.get('WINDIR')
+        candidates: list[str] = []
+        if sysroot:
+            candidates.append(str(Path(sysroot) / 'System32' / 'WindowsPowerShell' / 'v1.0' / 'powershell.exe'))
+        for name in ('powershell', 'pwsh'):
+            exe_path = shutil.which(name)
+            if exe_path:
+                candidates.append(exe_path)
+        for c in candidates:
+            if c and Path(c).exists():
+                return c
+    except Exception:
+        pass
+    return None
 
 class UpdateManager:
     """Кастомный менеджер обновлений (манифест latest.json на gh-pages).
@@ -149,39 +167,52 @@ class UpdateManager:
         exe = Path(sys.executable)
         if getattr(sys, "frozen", False) and exe.suffix.lower() == ".exe":
             try:
-                tmp_bat = Path(tempfile.gettempdir()) / f"clubsender_update_{int(time.time())}.bat"
-                bat_script = (
-                    "@echo off\r\n"
-                    "setlocal enableextensions\r\n"
-                    "set \"NEW=%~1\"\r\n"
-                    "set \"TARGET=%~2\"\r\n"
-                    "set \"PID=%~3\"\r\n"
-                    "set \"LOGDIR=%~4\"\r\n"
-                    "set \"SELF=%~f0\"\r\n"
-                    "if not exist \"%LOGDIR%\" mkdir \"%LOGDIR%\"\r\n"
-                    "set \"LOG=%LOGDIR%\\updater.log\"\r\n"
-                    ">>\"%LOG%\" echo [%%DATE%% %%TIME%%] Updater start. NEW=\"%NEW%\" TARGET=\"%TARGET%\" PID=%PID%\r\n"
-                    ":wait\r\n"
-                    ">>\"%LOG%\" echo [%%DATE%% %%TIME%%] Waiting process PID=%PID% to exit...\r\n"
-                    ">nul 2>&1 tasklist /fi \"pid eq %PID%\" | find \"%PID%\" && ( timeout /t 1 /nobreak >nul & goto wait )\r\n"
-                    ">>\"%LOG%\" echo [%%DATE%% %%TIME%%] Process exited, replacing file...\r\n"
-                    ":copyloop\r\n"
-                    "copy /y \"%NEW%\" \"%TARGET%\" >>\"%LOG%\" 2>&1\r\n"
-                    "if errorlevel 1 ( >>\"%LOG%\" echo [%%DATE%% %%TIME%%] copy failed, retry... & timeout /t 1 >nul & goto copyloop )\r\n"
-                    ">>\"%LOG%\" echo [%%DATE%% %%TIME%%] Starting new binary...\r\n"
-                    "start \"\" /D \"%~dp2\" \"%TARGET%\"\r\n"
-                    ">>\"%LOG%\" echo [%%DATE%% %%TIME%%] Cleanup...\r\n"
-                    "del /q \"%NEW%\" >nul 2>&1\r\n"
-                    "del /q \"%SELF%\" >nul 2>&1\r\n"
-                    "endlocal\r\n"
-                    "exit\r\n"
+                tmp_ps1 = Path(tempfile.gettempdir()) / f"clubsender_update_{int(time.time())}.ps1"
+                ps_script = (
+                    "param([string]$New,[string]$Target,[int]$ProcId,[string]$LogDir)\r\n"
+                    "$ErrorActionPreference='SilentlyContinue'\r\n"
+                    "if(!(Test-Path -LiteralPath $LogDir)){New-Item -ItemType Directory -Force -Path $LogDir | Out-Null}\r\n"
+                    "$Log = Join-Path $LogDir 'updater.log'\r\n"
+                    "function Log($m){ Add-Content -Path $Log -Value (\"[{0}] {1}\" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'), $m) }\r\n"
+                    "Log (\"Start. NEW=\"\"{0}\"\" TARGET=\"\"{1}\"\" PID={2}\" -f $New,$Target,$ProcId)\r\n"
+                    "if($ProcId -gt 0){ try{ Wait-Process -Id $ProcId -ErrorAction SilentlyContinue } catch{ Log (\"Wait-Process error: \" + $_) } }\r\n"
+                    "Log 'Replacing target...'\r\n"
+                    "$ok=$false; for($i=0;$i -lt 120 -and -not $ok;$i++){ try{ Copy-Item -Force -LiteralPath $New -Destination $Target; $ok=$true } catch{ Start-Sleep -Milliseconds 500 } }\r\n"
+                    "if(-not $ok){ Log 'Copy failed after retries' }\r\n"
+                    "$wd = Split-Path -Parent $Target\r\n"
+                    "Log 'Starting new binary (primary)...'\r\n"
+                    "$proc = $null\r\n"
+                    "try{ $proc = Start-Process -FilePath $Target -WorkingDirectory $wd -WindowStyle Hidden -PassThru } catch { Log (\"Start-Process error: \" + $_) }\r\n"
+                    "Start-Sleep -Milliseconds 400\r\n"
+                    "$started = $false\r\n"
+                    "if($proc -and $proc.Id){ try{ if(Get-Process -Id $proc.Id -ErrorAction SilentlyContinue){ $started = $true } } catch {} }\r\n"
+                    "if(-not $started){\r\n"
+                    "  Log 'Primary start not confirmed, trying fallback via cmd /c start'\r\n"
+                    "  try{ Start-Process -FilePath cmd.exe -ArgumentList @('/c','start','\"\"',$Target) -WorkingDirectory $wd -WindowStyle Hidden | Out-Null; $started=$true } catch { Log (\"Fallback start error: \" + $_) }\r\n"
+                    "}\r\n"
+                    "Log ('Done. started={0}' -f $started)\r\n"
+                    "try{ Remove-Item -LiteralPath $New -Force } catch{}\r\n"
+                    "try{ Remove-Item -LiteralPath $PSCommandPath -Force } catch{}\r\n"
                 )
-                tmp_bat.write_text(bat_script, encoding="utf-8")
-                log.info(f"[update] Updater script: {tmp_bat}")
+                tmp_ps1.write_text(ps_script, encoding="utf-8")
+                log.info(f"[update] Updater script: {tmp_ps1}")
                 creationflags = getattr(subprocess, 'CREATE_NO_WINDOW', 0) | getattr(subprocess, 'DETACHED_PROCESS', 0)
                 pid = os.getpid()
                 log_dir = exe.parent / "logs"
-                subprocess.Popen(["cmd", "/c", str(tmp_bat), str(new_file), str(exe), str(pid), str(log_dir)], creationflags=creationflags)
+                try:
+                    log_dir.mkdir(parents=True, exist_ok=True)
+                except Exception:
+                    pass
+                ps = _find_powershell()
+                if not ps:
+                    log.error("[update] Cannot locate PowerShell executable")
+                    return False
+                cmd = [
+                    ps, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(tmp_ps1),
+                    "-New", str(new_file), "-Target", str(exe), "-ProcId", str(pid), "-LogDir", str(log_dir)
+                ]
+                log.info(f"[update] Launching updater: {' '.join(map(str, cmd))}")
+                subprocess.Popen(cmd, creationflags=creationflags)
                 return True
             except Exception as e:
                 log.error(f"[update] Install (Windows) failed: {e}")
