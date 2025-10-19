@@ -617,7 +617,7 @@ class UpdateDownloadThread(QThread):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle(f"{APP_TITLE} v{__version__}")
+        self.setWindowTitle(APP_TITLE)
         self.resize(1200, 760)
 
         self.accounts: List[Account] = []
@@ -796,11 +796,16 @@ class MainWindow(QMainWindow):
             pass
         # Применим текущую настройку/системную по умолчанию
         self.apply_theme(self.theme_pref)
-        # Статус-бар с версией
+        # Статус-бар: кнопка обновления и версия в правом нижнем углу
         try:
-            self.statusBar().showMessage("")
-            ver_lbl = QLabel(f"Версия: {__version__}")
-            self.statusBar().addPermanentWidget(ver_lbl)
+            sb = self.statusBar()
+            sb.showMessage("")
+            self._btnUpdateSB = QPushButton("🔄 Обновить")
+            self._btnUpdateSB.setFlat(True)
+            self._btnUpdateSB.clicked.connect(self.on_check_update)
+            sb.addPermanentWidget(self._btnUpdateSB)
+            ver_lbl = QLabel(f"v{__version__}")
+            sb.addPermanentWidget(ver_lbl)
         except Exception:
             pass
 
