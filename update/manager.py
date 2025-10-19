@@ -240,14 +240,20 @@ class UpdateManager:
                 except Exception:
                     si = None
                 # Launch via cmd /c start to fully detach under possible Job objects
-                start_cmd = [os.environ.get('COMSPEC', 'cmd'), '/c', 'start', '', cmd[0]] + cmd[1:]
+start_cmd = [os.environ.get('COMSPEC', 'cmd'), '/c', 'start', '/b', '/min', '', cmd[0]] + cmd[1:]
                 try:
                     log.info(f"[update] Launch via cmd: {' '.join(map(str, start_cmd))}")
-                    subprocess.Popen(start_cmd, creationflags=flags, cwd=str(exe.parent), startupinfo=si, close_fds=True)
+env = os.environ.copy()
+for k in ('PYTHONHOME','PYTHONPATH','PYTHONUSERBASE','PYTHONNOUSERSITE','PYTHONEXECUTABLE','_MEIPASS','_MEIPASS2'):
+    env.pop(k, None)
+subprocess.Popen(start_cmd, creationflags=flags, cwd=str(exe.parent), startupinfo=si, close_fds=True, env=env)
                 except Exception as e:
                     log.error(f"[update] cmd-start failed: {e}; trying direct PS launch")
                     try:
-                        subprocess.Popen(cmd, creationflags=flags, cwd=str(exe.parent), startupinfo=si, close_fds=True)
+env = os.environ.copy()
+for k in ('PYTHONHOME','PYTHONPATH','PYTHONUSERBASE','PYTHONNOUSERSITE','PYTHONEXECUTABLE','_MEIPASS','_MEIPASS2'):
+    env.pop(k, None)
+subprocess.Popen(cmd, creationflags=flags, cwd=str(exe.parent), startupinfo=si, close_fds=True, env=env)
                     except Exception as e2:
                         log.error(f"[update] direct Popen failed: {e2}")
                         return False
