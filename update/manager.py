@@ -162,47 +162,41 @@ class UpdateManager:
 
     def _install_windows(self, new_file: Path) -> bool:
         exe = Path(sys.executable)
-        # Если запущены как упакованный .exe — используем PowerShell-скрипт обновления
+        # If running from PyInstaller onefile
         if getattr(sys, "frozen", False) and exe.suffix.lower() == ".exe":
             try:
                 tmp_ps1 = Path(tempfile.gettempdir()) / f"clubsender_update_{int(time.time())}.ps1"
-                ps1_script = (
-                    "param([string]$New,[string]$Target,[int]$ProcId,[string]$LogDir)\r\n"
-                    "$ErrorActionPreference='SilentlyContinue'\r\n"
-                    "if(!(Test-Path -LiteralPath $LogDir)){New-Item -ItemType Directory -Force -Path $LogDir | Out-Null}\r\n"
-                    "$Log = Join-Path $LogDir 'updater.log'\r\n"
-                    "function Log($m){ Add-Content -Path $Log -Value (\"[{0}] {1}\" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'), $m) }\r\n"
-                    "Log (\"Start. NEW='{0}' TARGET='{1}' PID={2}\" -f $New,$Target,$ProcId)\r\n"
-                    "if($ProcId -gt 0){ try{ Wait-Process -Id $ProcId -ErrorAction SilentlyContinue } catch{} }\r\n"
-                    "Log 'Replacing target...'\r\n"
-                    "$ok=$false; for($i=0;$i -lt 60 -and -not $ok;$i++){ try{ Copy-Item -Force -LiteralPath $New -Destination $Target; $ok=$true } catch{ Start-Sleep -Seconds 1 } }\r\n"
-                    "Log (\"Copy result: {0}\" -f ($ok))\r\n"
-                    "Log 'Starting new binary...'\r\n"
-                    "$wd = Split-Path -Parent $Target\r\n"
-                    "try{ Start-Process -FilePath $Target -WorkingDirectory $wd -WindowStyle Normal | Out-Null } catch{}\r\n"
-                    "Log 'Cleanup...'\r\n"
-                    "try{ Remove-Item -LiteralPath $New -Force } catch{}\r\n"
-                    "try{ Remove-Item -LiteralPath $PSCommandPath -Force } catch{}\r\n"
-                )
-                tmp_ps1.write_text(ps1_script, encoding="utf-8")
+                ps_script = """
+param([string]$New,[string]$Target,[int]$Pid,[string]$LogDir)
+$ErrorActionPreference='SilentlyContinue'
+if(!(Test-Path -LiteralPath $LogDir)){New-Item -ItemType Directory -Force -Path $LogDir | Out-Null}
+$Log = Join-Path $LogDir 'updater.log'
+function Log($m){ Add-Content -Path $Log -Value ("[{0}] {1}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'), $m) }
+Log ("Start. NEW=\"{0}\" TARGET=\"{1}\" PID={2}" -f $New,$Target,$Pid)
+if($Pid -gt 0){ try{ Wait-Process -Id $Pid -ErrorAction SilentlyContinue } catch{} }
+Log 'Replacing target...'
+$ok=$false; for($i=0;$i -lt 60 -and -not $ok;$i++){ try{ Copy-Item -Force -LiteralPath $New -Destination $Target; $ok=$true } catch{ Start-Sleep -Seconds 1 } }
+Log 'Starting new binary...'
+$wd = Split-Path -Parent $Target
+Start-Process -FilePath $Target -WorkingDirectory $wd -WindowStyle Hidden | Out-Null
+try{ Remove-Item -LiteralPath $New -Force } catch{}
+try{ Remove-Item -LiteralPath $PSCommandPath -Force } catch{}
+""".strip()
+                tmp_ps1.write_text(ps_script, encoding="utf-8")
                 log.info(f"[update] Updater script: {tmp_ps1}")
+                # Launch PowerShell updater hidden
                 creationflags = getattr(subprocess, 'CREATE_NO_WINDOW', 0) | getattr(subprocess, 'DETACHED_PROCESS', 0)
                 pid = os.getpid()
                 log_dir = exe.parent / "logs"
-                # Запускаем PowerShell с обходом ExecutionPolicy
                 subprocess.Popen([
-                    "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(tmp_ps1),
-                    "-New", str(new_file), "-Target", str(exe), "-ProcId", str(pid), "-LogDir", str(log_dir)
+                    "powershell","-NoProfile","-ExecutionPolicy","Bypass","-File",str(tmp_ps1),
+                    str(new_file),str(exe),str(pid),str(log_dir)
                 ], creationflags=creationflags)
                 return True
             except Exception as e:
                 log.error(f"[update] Install (Windows) failed: {e}")
                 return False
-<<<<<<< Updated upstream
         # Not frozen: just launch the downloaded binary/installer
-=======
-        # Нефризованный режим: просто запускаем скачанный бинарник (без замены самого процесса)
->>>>>>> Stashed changes
         try:
             subprocess.Popen([str(new_file)])
             return True

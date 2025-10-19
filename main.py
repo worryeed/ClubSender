@@ -40,7 +40,7 @@ from core.messages import Icons, format_login_step, format_join_result, MESSAGES
 from core.version import __version__
 from update.manager import UpdateManager
 
-APP_TITLE = "ClubSender"
+APP_TITLE = "Little Pony Games API Manager"
 ACCOUNTS_COLUMNS = ["Имя пользователя", "Пароль", "Прокси", "ID устройства", "Токен (кратко)", "Последний вход"]
 EXTRA_COLUMNS = ["Прогресс", "Статус", "Текущий клуб"]
 REPORT_COLUMNS = ["Время", "Имя пользователя", "ID клуба", "Успешно", "Сообщение"]
@@ -796,16 +796,11 @@ class MainWindow(QMainWindow):
             pass
         # Применим текущую настройку/системную по умолчанию
         self.apply_theme(self.theme_pref)
-        # Статус-бар: кнопка обновления и версия в правом нижнем углу
+        # Статус-бар с версией
         try:
-            sb = self.statusBar()
-            sb.showMessage("")
-            self._btnUpdateSB = QPushButton("🔄 Обновить")
-            self._btnUpdateSB.setFlat(True)
-            self._btnUpdateSB.clicked.connect(self.on_check_update)
-            sb.addPermanentWidget(self._btnUpdateSB)
-            ver_lbl = QLabel(f"v{__version__}")
-            sb.addPermanentWidget(ver_lbl)
+            self.statusBar().showMessage("")
+            ver_lbl = QLabel(f"Версия: {__version__}")
+            self.statusBar().addPermanentWidget(ver_lbl)
         except Exception:
             pass
 
