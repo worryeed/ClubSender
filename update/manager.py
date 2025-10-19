@@ -34,18 +34,24 @@ def _semver_tuple(v: str) -> tuple:
 
 
 def _find_powershell() -> Optional[str]:
+    """Prefer 64-bit PowerShell via Sysnative to avoid WOW64 redirection."""
     try:
-        sysroot = os.environ.get('SystemRoot') or os.environ.get('WINDIR')
+        windir = os.environ.get('WINDIR') or os.environ.get('SystemRoot')
         candidates: list[str] = []
-        if sysroot:
-            candidates.append(str(Path(sysroot) / 'System32' / 'WindowsPowerShell' / 'v1.0' / 'powershell.exe'))
+        if windir:
+            # Sysnative resolves to 64-bit System32 from 32-bit contexts
+            candidates.append(str(Path(windir) / 'Sysnative' / 'WindowsPowerShell' / 'v1.0' / 'powershell.exe'))
+            candidates.append(str(Path(windir) / 'System32' / 'WindowsPowerShell' / 'v1.0' / 'powershell.exe'))
         for name in ('powershell', 'pwsh'):
             exe_path = shutil.which(name)
             if exe_path:
                 candidates.append(exe_path)
         for c in candidates:
-            if c and Path(c).exists():
-                return c
+            try:
+                if c and Path(c).exists():
+                    return c
+            except Exception:
+                continue
     except Exception:
         pass
     return None
@@ -229,89 +235,95 @@ class UpdateManager:
                     "-New", str(new_file), "-Target", str(exe), "-ProcId", str(pid), "-LogDir", str(log_dir)
                 ]
                 log.info(f"[update] Launching updater: {' '.join(map(str, cmd))}")
+                # Creation flags: detach from job and session; hide window unless debug requested
                 flags = 0
-                for _f in ('CREATE_NO_WINDOW', 'DETACHED_PROCESS', 'CREATE_NEW_PROCESS_GROUP', 'CREATE_BREAKAWAY_FROM_JOB'):
+                for _f in ('DETACHED_PROCESS', 'CREATE_NEW_PROCESS_GROUP', 'CREATE_BREAKAWAY_FROM_JOB'):
                     flags |= getattr(subprocess, _f, 0)
+                show_console = (os.environ.get('XP_UPDATER_DEBUG','').strip().lower() in ('1','true','yes'))
+                if not show_console:
+                    flags |= getattr(subprocess, 'CREATE_NO_WINDOW', 0)
+                # startup info
                 si = None
                 try:
                     si = subprocess.STARTUPINFO()
-                    si.dwFlags |= getattr(subprocess, 'STARTF_USESHOWWINDOW', 0)
-                    si.wShowWindow = 0
+                    if not show_console:
+                        si.dwFlags |= getattr(subprocess, 'STARTF_USESHOWWINDOW', 0)
+                        si.wShowWindow = 0
                 except Exception:
                     si = None
-                # Launch via cmd /c start to fully detach under possible Job objects
-                start_cmd = [os.environ.get('COMSPEC', 'cmd'), '/c', 'start', '/b', '/min', '""', cmd[0]] + cmd[1:]
+                # 1) Try direct PowerShell launch (preferred)
                 try:
+                    env = os.environ.copy()
+                    for k in ('PYTHONHOME','PYTHONPATH','PYTHONUSERBASE','PYTHONNOUSERSITE','PYTHONEXECUTABLE','_MEIPASS','_MEIPASS2'):
+                        env.pop(k, None)
+                    p = subprocess.Popen(cmd, creationflags=flags, cwd=str(exe.parent), startupinfo=si, close_fds=True, env=env)
+                    log.info(f"[update] Direct PowerShell spawn OK (pid={getattr(p, 'pid', '?')})")
+                    return True
+                except Exception as e:
+                    log.error(f"[update] direct PowerShell failed: {e}; trying cmd /c start")
+                # 2) Fallback: cmd /c start (optionally hidden/minimized)
+                try:
+                    start_args = [os.environ.get('COMSPEC', 'cmd'), '/c', 'start']
+                    if show_console:
+                        start_args += ['""']  # visible window
+                    else:
+                        start_args += ['/b', '/min', '""']
+                    start_cmd = start_args + [cmd[0]] + cmd[1:]
                     log.info(f"[update] Launch via cmd: {' '.join(map(str, start_cmd))}")
                     env = os.environ.copy()
                     for k in ('PYTHONHOME','PYTHONPATH','PYTHONUSERBASE','PYTHONNOUSERSITE','PYTHONEXECUTABLE','_MEIPASS','_MEIPASS2'):
                         env.pop(k, None)
                     subprocess.Popen(start_cmd, creationflags=flags, cwd=str(exe.parent), startupinfo=si, close_fds=True, env=env)
+                    return True
                 except Exception as e:
-                    log.error(f"[update] cmd-start failed: {e}; trying direct PS launch")
+                    log.error(f"[update] cmd-start failed: {e}; trying .bat fallback")
+                # 3) Fallback: plain .bat updater (no PowerShell)
+                try:
+                    bat_path = exe.parent / "clubsender_update.bat"
+                    bat_content = (
+                        "@echo off\r\n"
+                        "setlocal enableextensions\r\n"
+                        "set NEW=%1\r\n"
+                        "set TARGET=%2\r\n"
+                        ":waitloop\r\n"
+                        "timeout /t 1 /nobreak >nul\r\n"
+                        "(del /f /q \"%TARGET%\") >nul 2>&1\r\n"
+                        "if exist \"%TARGET%\" goto waitloop\r\n"
+                        "move /y \"%NEW%\" \"%TARGET%\" >nul 2>&1\r\n"
+                        "start \"\" \"%TARGET%\"\r\n"
+                        "endlocal\r\n"
+                        "exit\r\n"
+                    )
                     try:
-                        env = os.environ.copy()
-                        for k in ('PYTHONHOME','PYTHONPATH','PYTHONUSERBASE','PYTHONNOUSERSITE','PYTHONEXECUTABLE','_MEIPASS','_MEIPASS2'):
-                            env.pop(k, None)
-                        subprocess.Popen(cmd, creationflags=flags, cwd=str(exe.parent), startupinfo=si, close_fds=True, env=env)
-                        return True
-                    except Exception as e2:
-                        log.error(f"[update] direct PS launch failed: {e2}; trying .bat fallback")
-                        # --- Fallback 1: plain .bat updater (no PowerShell) ---
-                        try:
-                            bat_path = exe.parent / "clubsender_update.bat"
-                            bat_content = (
-                                "@echo off\r\n"
-                                "setlocal enableextensions\r\n"
-                                "set NEW=%1\r\n"
-                                "set TARGET=%2\r\n"
-                                ":waitloop\r\n"
-                                "timeout /t 1 /nobreak >nul\r\n"
-                                "(del /f /q \"%TARGET%\") >nul 2>&1\r\n"
-                                "if exist \"%TARGET%\" goto waitloop\r\n"
-                                "move /y \"%NEW%\" \"%TARGET%\" >nul 2>&1\r\n"
-                                "start \"\" \"%TARGET%\"\r\n"
-                                "endlocal\r\n"
-                                "exit\r\n"
-                            )
-                            try:
-                                bat_path.write_text(bat_content, encoding="utf-8")
-                            except Exception:
-                                # fallback to temp dir if cannot write next to exe
-                                bat_path = Path(tempfile.gettempdir()) / "clubsender_update.bat"
-                                bat_path.write_text(bat_content, encoding="utf-8")
-                            bat_cmd = [os.environ.get('COMSPEC','cmd'), '/c', 'start', '', str(bat_path), str(new_file), str(exe)]
-                            log.info(f"[update] .bat fallback launch: {' '.join(map(str, bat_cmd))}")
-                            env2 = os.environ.copy()
-                            for k in ('PYTHONHOME','PYTHONPATH','PYTHONUSERBASE','PYTHONNOUSERSITE','PYTHONEXECUTABLE','_MEIPASS','_MEIPASS2'):
-                                env2.pop(k, None)
-                            subprocess.Popen(bat_cmd, creationflags=flags, cwd=str(exe.parent), startupinfo=si, close_fds=True, env=env2)
-                            return True
-                        except Exception as e_bat:
-                            log.error(f"[update] .bat fallback failed: {e_bat}; trying schtasks fallback")
-                            # --- Fallback 2: schedule a one-shot task to run the .bat ---
-                            try:
-                                import datetime
-                                # ensure bat exists
-                                if 'bat_path' not in locals() or not Path(bat_path).exists():
-                                    bat_path = Path(tempfile.gettempdir()) / "clubsender_update.bat"
-                                    bat_path.write_text(bat_content, encoding="utf-8")
-                                task_name = f"ClubSenderUpdate_{os.getpid()}"
-                                run_time = (datetime.datetime.now() + datetime.timedelta(seconds=30)).strftime("%H:%M")
-                                tr = f'"{bat_path}" "{new_file}" "{exe}"'
-                                log.info(f"[update] Scheduling task {task_name} at {run_time} -> {tr}")
-                                # Create
-                                subprocess.check_call([
-                                    'schtasks', '/Create', '/SC', 'ONCE', '/ST', run_time,
-                                    '/TN', task_name, '/TR', tr, '/F'
-                                ])
-                                # Run immediately
-                                subprocess.check_call(['schtasks', '/Run', '/TN', task_name])
-                                return True
-                            except Exception as e_task:
-                                log.error(f"[update] schtasks fallback failed: {e_task}")
-                                return False
-                return True
+                        bat_path.write_text(bat_content, encoding="utf-8")
+                    except Exception:
+                        bat_path = Path(tempfile.gettempdir()) / "clubsender_update.bat"
+                        bat_path.write_text(bat_content, encoding="utf-8")
+                    bat_cmd = [os.environ.get('COMSPEC','cmd'), '/c', 'start', '""', str(bat_path), str(new_file), str(exe)]
+                    log.info(f"[update] .bat fallback launch: {' '.join(map(str, bat_cmd))}")
+                    env2 = os.environ.copy()
+                    for k in ('PYTHONHOME','PYTHONPATH','PYTHONUSERBASE','PYTHONNOUSERSITE','PYTHONEXECUTABLE','_MEIPASS','_MEIPASS2'):
+                        env2.pop(k, None)
+                    subprocess.Popen(bat_cmd, creationflags=flags, cwd=str(exe.parent), startupinfo=si, close_fds=True, env=env2)
+                    return True
+                except Exception as e_bat:
+                    log.error(f"[update] .bat fallback failed: {e_bat}; trying schtasks fallback")
+                # 4) Fallback: schedule a one-shot task to run the .bat
+                try:
+                    import datetime
+                    if 'bat_path' not in locals() or not Path(bat_path).exists():
+                        bat_path = Path(tempfile.gettempdir()) / "clubsender_update.bat"
+                        bat_path.write_text(bat_content, encoding="utf-8")
+                    task_name = f"ClubSenderUpdate_{os.getpid()}"
+                    run_time = (datetime.datetime.now() + datetime.timedelta(seconds=30)).strftime("%H:%M")
+                    tr = f'"{bat_path}" "{new_file}" "{exe}"'
+                    log.info(f"[update] Scheduling task {task_name} at {run_time} -> {tr}")
+                    subprocess.check_call(['schtasks', '/Create', '/SC', 'ONCE', '/ST', run_time, '/TN', task_name, '/TR', tr, '/F'])
+                    subprocess.check_call(['schtasks', '/Run', '/TN', task_name])
+                    return True
+                except Exception as e_task:
+                    log.error(f"[update] schtasks fallback failed: {e_task}")
+                    return False
             except Exception as e:
                 log.error(f"[update] Install (Windows) failed: {e}")
                 return False
