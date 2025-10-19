@@ -1,10 +1,10 @@
 {
-  "version": "1.0.20",
-  "notes": "Версия 1.0.20: фикс PowerShell-апдейтера (-ProcId, ретраи, fallback start); кнопка обновления в статус-баре.",
+  "version": "1.0.21",
+  "notes": "Версия 1.0.21: минорные улучшения, основано на 1.0.20.",
   "assets": {
     "windows": {
-      "url": "https://github.com/worryeed/ClubSender/releases/download/v1.0.20/ClubSender.exe",
-      "sha256": "CD78BCBFD6F009F0599F10D9638081BFE9D2AF5E374BE5AF429D963129D1D220"
+      "url": "https://github.com/worryeed/ClubSender/releases/download/v1.0.21/ClubSender.exe",
+      "sha256": "C3CB3AFAD7B9C8E0B6B25A96F3E7B06DB8397DED3EA0A9A5603D015AC3490709"
     }
   }
 }
