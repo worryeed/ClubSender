@@ -1,10 +1,10 @@
 {
-  "version": "1.0.28",
-  "notes": "Версия 1.0.28: фикс PYDLL ошибки при автообновлении; скрыта консоль при запуске апдейтера",
+  "version": "1.0.29",
+  "notes": "Версия 1.0.29: автообновление — чистим окружение и скрываем консоль",
   "assets": {
     "windows": {
-      "url": "https://github.com/worryeed/ClubSender/releases/download/v1.0.28/ClubSender.exe",
-      "sha256": "6FE491023A95C7DA77068AC5CEB386046C120896C4494EBEEC82F949D515B755"
+      "url": "https://github.com/worryeed/ClubSender/releases/download/v1.0.29/ClubSender.exe",
+      "sha256": "ADB74ABD0363E56E4682086B5D5B80B30EC3D0B3FC50AED015FC7FE22E0AEF9A"
     }
   }
 }
