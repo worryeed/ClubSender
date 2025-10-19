@@ -229,7 +229,21 @@ class UpdateManager:
                     "-New", str(new_file), "-Target", str(exe), "-ProcId", str(pid), "-LogDir", str(log_dir)
                 ]
                 log.info(f"[update] Launching updater: {' '.join(map(str, cmd))}")
-                subprocess.Popen(cmd, creationflags=creationflags)
+                flags = 0
+                for _f in ('CREATE_NO_WINDOW', 'DETACHED_PROCESS', 'CREATE_NEW_PROCESS_GROUP', 'CREATE_BREAKAWAY_FROM_JOB'):
+                    flags |= getattr(subprocess, _f, 0)
+                si = None
+                try:
+                    si = subprocess.STARTUPINFO()
+                    si.dwFlags |= getattr(subprocess, 'STARTF_USESHOWWINDOW', 0)
+                    si.wShowWindow = 0
+                except Exception:
+                    si = None
+                try:
+                    subprocess.Popen(cmd, creationflags=flags, cwd=str(exe.parent), startupinfo=si, close_fds=True)
+                except Exception as e:
+                    log.error(f"[update] Popen failed: {e}")
+                    return False
                 return True
             except Exception as e:
                 log.error(f"[update] Install (Windows) failed: {e}")
