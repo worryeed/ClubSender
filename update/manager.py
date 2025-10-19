@@ -230,34 +230,44 @@ class UpdateManager:
                 ]
                 log.info(f"[update] Prepared updater cmd: {' '.join(map(str, cmd))}")
                 # Prepare .bat updater (primary for scheduling)
-                bat_path = exe.parent / "clubsender_update.bat"
+                # Write updater .bat to temp to avoid clutter near exe
+                bat_path = Path(tempfile.gettempdir()) / "clubsender_update.bat"
                 bat_content = (
                     "@echo off\r\n"
                     "setlocal enableextensions\r\n"
-                    "set NEW=%1\r\n"
-                    "set TARGET=%2\r\n"
+                    "set NEW=%~1\r\n"
+                    "set TARGET=%~2\r\n"
+                    "set WD=%~dp2\r\n"
                     ":waitloop\r\n"
                     "timeout /t 1 /nobreak >nul\r\n"
                     "(del /f /q \"%TARGET%\") >nul 2>&1\r\n"
                     "if exist \"%TARGET%\" goto waitloop\r\n"
                     "move /y \"%NEW%\" \"%TARGET%\" >nul 2>&1\r\n"
-                    "start \"\" \"%TARGET%\"\r\n"
+                    "start \"\" /D \"%WD%\" \"%TARGET%\"\r\n"
+                    "start \"\" cmd /c del /f /q \"%~f0\"\r\n"
                     "endlocal\r\n"
                     "exit\r\n"
                 )
                 try:
                     bat_path.write_text(bat_content, encoding="utf-8")
                 except Exception:
-                    bat_path = Path(tempfile.gettempdir()) / "clubsender_update.bat"
+                    bat_path = Path(tempfile.gettempdir()) / f"clubsender_update_{int(time.time())}.bat"
                     bat_path.write_text(bat_content, encoding="utf-8")
-                # Primary: schedule .bat outside job
+                # Primary: schedule .bat outside job (interactive)
                 try:
-                    import datetime
+                    import datetime, getpass
                     task_name = f"ClubSenderUpdate_{os.getpid()}"
                     run_time = (datetime.datetime.now() + datetime.timedelta(seconds=30)).strftime("%H:%M")
                     tr = f'"{bat_path}" "{new_file}" "{exe}"'
                     log.info(f"[update] Scheduling task {task_name} at {run_time} -> {tr}")
-                    subprocess.check_call(['schtasks', '/Create', '/SC', 'ONCE', '/ST', run_time, '/TN', task_name, '/TR', tr, '/F'])
+                    # Try interactive run for current user; on failure, fallback below
+                    ru = os.environ.get('USERNAME') or getpass.getuser()
+                    create_cmd = ['schtasks', '/Create', '/SC', 'ONCE', '/ST', run_time, '/TN', task_name, '/TR', tr, '/F', '/RL', 'HIGHEST', '/RU', ru, '/IT']
+                    try:
+                        subprocess.check_call(create_cmd)
+                    except Exception as e_create:
+                        log.error(f"[update] schtasks /Create (interactive) failed: {e_create}; retry without /IT and /RU")
+                        subprocess.check_call(['schtasks', '/Create', '/SC', 'ONCE', '/ST', run_time, '/TN', task_name, '/TR', tr, '/F'])
                     subprocess.check_call(['schtasks', '/Run', '/TN', task_name])
                     return True
                 except Exception as e_task:
