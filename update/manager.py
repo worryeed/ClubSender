@@ -221,11 +221,18 @@ class UpdateManager:
                     si.wShowWindow = 0
                 except Exception:
                     si = None
+                # Prefer cmd /c start to detach from possible Job objects
+                start_cmd = [os.environ.get('COMSPEC', 'cmd'), '/c', 'start', '', cmd[0]] + cmd[1:]
                 try:
-                    subprocess.Popen(cmd, creationflags=flags, cwd=str(exe.parent), startupinfo=si, close_fds=True)
+                    log.info(f"[update] Launch via cmd: {' '.join(map(str, start_cmd))}")
+                    subprocess.Popen(start_cmd, creationflags=flags, cwd=str(exe.parent), startupinfo=si, close_fds=True)
                 except Exception as e:
-                    log.error(f"[update] Popen failed: {e}")
-                    return False
+                    log.error(f"[update] cmd-start failed: {e}; trying direct PS launch")
+                    try:
+                        subprocess.Popen(cmd, creationflags=flags, cwd=str(exe.parent), startupinfo=si, close_fds=True)
+                    except Exception as e2:
+                        log.error(f"[update] direct Popen failed: {e2}")
+                        return False
                 return True
             except Exception as e:
                 log.error(f"[update] Install (Windows) failed: {e}")
