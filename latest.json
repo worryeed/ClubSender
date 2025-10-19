@@ -1,10 +1,10 @@
 {
-  "version": "1.0.27",
-  "notes": "Версия 1.0.27: минорные улучшения (detach через cmd /c start)",
+  "version": "1.0.28",
+  "notes": "Версия 1.0.28: фикс PYDLL ошибки при автообновлении; скрыта консоль при запуске апдейтера",
   "assets": {
     "windows": {
-      "url": "https://github.com/worryeed/ClubSender/releases/download/v1.0.27/ClubSender.exe",
-      "sha256": "57D494CEA599E0AECBD72800CEB56642E477EC0264F03665C693900E56A98A11"
+      "url": "https://github.com/worryeed/ClubSender/releases/download/v1.0.28/ClubSender.exe",
+      "sha256": "6FE491023A95C7DA77068AC5CEB386046C120896C4494EBEEC82F949D515B755"
     }
   }
 }
