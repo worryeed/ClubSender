@@ -40,7 +40,7 @@ from core.messages import Icons, format_login_step, format_join_result, MESSAGES
 from core.version import __version__
 from update.manager import UpdateManager
 
-APP_TITLE = "Little Pony Games API Manager"
+APP_TITLE = "ClubSender"
 ACCOUNTS_COLUMNS = ["Имя пользователя", "Пароль", "Прокси", "ID устройства", "Токен (кратко)", "Последний вход"]
 EXTRA_COLUMNS = ["Прогресс", "Статус", "Текущий клуб"]
 REPORT_COLUMNS = ["Время", "Имя пользователя", "ID клуба", "Успешно", "Сообщение"]
