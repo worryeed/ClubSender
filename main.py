@@ -686,7 +686,6 @@ class MainWindow(QMainWindow):
         operations_layout.addWidget(self.btn_pause)
         operations_layout.addWidget(self.btn_stop)
         operations_layout.addWidget(self.btn_export)
-        operations_layout.addWidget(self.btn_check_update)
         # Тема (светлая/тёмная/системная)
         operations_layout.addWidget(QLabel("Тема:"))
         self.cmb_theme = QComboBox()
@@ -796,11 +795,17 @@ class MainWindow(QMainWindow):
             pass
         # Применим текущую настройку/системную по умолчанию
         self.apply_theme(self.theme_pref)
-        # Статус-бар с версией
+        # Статус-бар: кнопка обновления рядом с версией
         try:
-            self.statusBar().showMessage("")
+            sb = self.statusBar()
+            sb.showMessage("")
+            try:
+                self.btn_check_update.setFlat(True)
+            except Exception:
+                pass
+            sb.addPermanentWidget(self.btn_check_update)
             ver_lbl = QLabel(f"Версия: {__version__}")
-            self.statusBar().addPermanentWidget(ver_lbl)
+            sb.addPermanentWidget(ver_lbl)
         except Exception:
             pass
 
