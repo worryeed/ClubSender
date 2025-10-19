@@ -1,10 +1,10 @@
 {
-  "version": "1.0.31",
-  "notes": "Версия 1.0.31: мелкие улучшения и исправления.",
+  "version": "1.0.32",
+  "notes": "Версия 1.0.32: апдейтер — добавлены fallback .bat и schtasks для перезапуска без PowerShell.",
   "assets": {
     "windows": {
-      "url": "https://github.com/worryeed/ClubSender/releases/download/v1.0.31/ClubSender.exe",
-      "sha256": "C0E7F60E1F6E835BF7106235676AA9D31EB9D1E534084E9065CD5BF1E5933F06"
+      "url": "https://github.com/worryeed/ClubSender/releases/download/v1.0.32/ClubSender.exe",
+      "sha256": "7596499B8326656CD6BFA139B4F5EF7A9DCBA3DA8BCCBCCCC7EB8DE636EA7D9A"
     }
   }
 }
