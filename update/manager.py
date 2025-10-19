@@ -180,15 +180,17 @@ class UpdateManager:
                     "$ok=$false; for($i=0;$i -lt 120 -and -not $ok;$i++){ try{ Copy-Item -Force -LiteralPath $New -Destination $Target; $ok=$true } catch{ Start-Sleep -Milliseconds 500 } }\r\n"
                     "if(-not $ok){ Log 'Copy failed after retries' }\r\n"
                     "$wd = Split-Path -Parent $Target\r\n"
-                    "Log 'Starting new binary (primary)...'\r\n"
-                    "$proc = $null\r\n"
-                    "try{ $proc = Start-Process -FilePath $Target -WorkingDirectory $wd -WindowStyle Hidden -PassThru } catch { Log (\"Start-Process error: \" + $_) }\r\n"
-                    "Start-Sleep -Milliseconds 400\r\n"
-                    "$started = $false\r\n"
-                    "if($proc -and $proc.Id){ try{ if(Get-Process -Id $proc.Id -ErrorAction SilentlyContinue){ $started = $true } } catch {} }\r\n"
+                    "Log 'Starting new binary with sanitized environment...'\r\n"
+                    "$psi = New-Object System.Diagnostics.ProcessStartInfo\r\n"
+                    "$psi.FileName = $Target\r\n"
+                    "$psi.WorkingDirectory = $wd\r\n"
+                    "$psi.UseShellExecute = $false\r\n"
+                    "$psi.CreateNoWindow = $true\r\n"
+                    "foreach($k in @('PYTHONHOME','PYTHONPATH','PYTHONUSERBASE','PYTHONNOUSERSITE','PYTHONEXECUTABLE','_MEIPASS','_MEIPASS2')){ try{ $psi.EnvironmentVariables.Remove($k) } catch{} }\r\n"
+                    "try{ [System.Diagnostics.Process]::Start($psi) | Out-Null; $started=$true } catch { Log (\"ProcessStart error: \" + $_); $started=$false }\r\n"
                     "if(-not $started){\r\n"
-                    "  Log 'Primary start not confirmed, trying fallback via cmd /c start'\r\n"
-                    "  try{ Start-Process -FilePath cmd.exe -ArgumentList @('/c','start','\"\"',$Target) -WorkingDirectory $wd -WindowStyle Hidden | Out-Null; $started=$true } catch { Log (\"Fallback start error: \" + $_) }\r\n"
+                    "  Log 'Fallback: cmd /c start'\r\n"
+                    "  try{ Start-Process -FilePath cmd.exe -ArgumentList @('/c','start','/b','/min','\"\"',$Target) -WorkingDirectory $wd -WindowStyle Hidden | Out-Null; $started=$true } catch { Log (\"Fallback start error: \" + $_) }\r\n"
                     "}\r\n"
                     "Log ('Done. started={0}' -f $started)\r\n"
                     "try{ Remove-Item -LiteralPath $New -Force } catch{}\r\n"
@@ -222,14 +224,20 @@ class UpdateManager:
                 except Exception:
                     si = None
                 # Prefer cmd /c start to detach from possible Job objects
-                start_cmd = [os.environ.get('COMSPEC', 'cmd'), '/c', 'start', '', cmd[0]] + cmd[1:]
+                start_cmd = [os.environ.get('COMSPEC', 'cmd'), '/c', 'start', '/b', '/min', '', cmd[0]] + cmd[1:]
                 try:
                     log.info(f"[update] Launch via cmd: {' '.join(map(str, start_cmd))}")
-                    subprocess.Popen(start_cmd, creationflags=flags, cwd=str(exe.parent), startupinfo=si, close_fds=True)
+                    env = os.environ.copy()
+                    for k in ('PYTHONHOME','PYTHONPATH','PYTHONUSERBASE','PYTHONNOUSERSITE','PYTHONEXECUTABLE','_MEIPASS','_MEIPASS2'):
+                        env.pop(k, None)
+                    subprocess.Popen(start_cmd, creationflags=flags, cwd=str(exe.parent), startupinfo=si, close_fds=True, env=env)
                 except Exception as e:
                     log.error(f"[update] cmd-start failed: {e}; trying direct PS launch")
                     try:
-                        subprocess.Popen(cmd, creationflags=flags, cwd=str(exe.parent), startupinfo=si, close_fds=True)
+                        env = os.environ.copy()
+                        for k in ('PYTHONHOME','PYTHONPATH','PYTHONUSERBASE','PYTHONNOUSERSITE','PYTHONEXECUTABLE','_MEIPASS','_MEIPASS2'):
+                            env.pop(k, None)
+                        subprocess.Popen(cmd, creationflags=flags, cwd=str(exe.parent), startupinfo=si, close_fds=True, env=env)
                     except Exception as e2:
                         log.error(f"[update] direct Popen failed: {e2}")
                         return False
