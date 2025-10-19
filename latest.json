@@ -1,10 +1,10 @@
 {
-  "version": "1.0.38",
-  "notes": "Версия 1.0.38: schtasks интерактивный; .bat в TEMP с самоудалением; запуск с правильной рабочей директорией.",
+  "version": "1.0.39",
+  "notes": "Версия 1.0.39: минорный релиз.",
   "assets": {
     "windows": {
-      "url": "https://github.com/worryeed/ClubSender/releases/download/v1.0.38/ClubSender.exe",
-      "sha256": "0DA0E77418DEB26EA98E04F2603FE6F29DAA9A3464B1FF58E72FC979352F4E2E"
+      "url": "https://github.com/worryeed/ClubSender/releases/download/v1.0.39/ClubSender.exe",
+      "sha256": "1E0C2E4518909BBCC14A68D783DC8C3808CD30D84249D9C52189BB13B4D7E708"
     }
   }
 }
