@@ -1,10 +1,10 @@
 {
-  "version": "1.0.39",
-  "notes": "Версия 1.0.39: минорный релиз.",
+  "version": "1.0.40",
+  "notes": "Версия 1.0.40: ребрендинг — заголовок окна ClubSender.",
   "assets": {
     "windows": {
-      "url": "https://github.com/worryeed/ClubSender/releases/download/v1.0.39/ClubSender.exe",
-      "sha256": "1E0C2E4518909BBCC14A68D783DC8C3808CD30D84249D9C52189BB13B4D7E708"
+      "url": "https://github.com/worryeed/ClubSender/releases/download/v1.0.40/ClubSender.exe",
+      "sha256": "DD75D16DA03C79F30DE40F46F0EA6CD00FB17E46A6B276A2117F90306A9D5C45"
     }
   }
 }
