@@ -39,7 +39,11 @@ from core import Account, JoinResult, XPokerAPI, ApiError
 from core.messages import Icons, format_login_step, format_join_result, MESSAGES
 
 # Версия приложения
-__version__ = "1.0.19"
+try:
+    from core.version import __version__ as _ver
+    __version__ = _ver
+except Exception:
+    __version__ = "1.0.0"
 
 APP_TITLE = "Little Pony Games API Manager"
 ACCOUNTS_COLUMNS = ["Имя пользователя", "Пароль", "Прокси", "ID устройства", "Токен (кратко)", "Последний вход"]
@@ -791,12 +795,25 @@ class MainWindow(QMainWindow):
     def on_check_update(self):
         """Проверить доступность обновления."""
         try:
-            from update.manager import UpdateManager
-            
+            # Надёжный импорт UpdateManager (fallback на загрузку из файла)
+            try:
+                from update.manager import UpdateManager  # type: ignore
+            except Exception:
+                import importlib.util, pathlib
+                mod_path = pathlib.Path(__file__).parent / "update" / "manager.py"
+                spec = importlib.util.spec_from_file_location("update.manager", mod_path)
+                if spec and spec.loader:
+                    _mod = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(_mod)  # type: ignore
+                    UpdateManager = getattr(_mod, "UpdateManager", None)  # type: ignore
+                else:
+                    UpdateManager = None  # type: ignore
+            if not UpdateManager:
+                QMessageBox.critical(self, "Обновление", "Модуль обновления недоступен")
+                return
             self.log.appendPlainText(f"{Icons.INFO} Проверка обновлений... Текущая версия: {__version__}")
             manager = UpdateManager(__version__)
             latest_info = manager.check_for_update()
-            
             if latest_info:
                 latest = latest_info.get('version', 'unknown')
                 self.log.appendPlainText(f"{Icons.INFO} Доступна новая версия: {latest}")
