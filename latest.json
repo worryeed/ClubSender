@@ -1,10 +1,10 @@
 {
-  "version": "1.0.26",
-  "notes": "Версия 1.0.26: запуск апдейтера через cmd /c start (полное отделение), fallback прямой запуск",
+  "version": "1.0.27",
+  "notes": "Версия 1.0.27: минорные улучшения (detach через cmd /c start)",
   "assets": {
     "windows": {
-      "url": "https://github.com/worryeed/ClubSender/releases/download/v1.0.26/ClubSender.exe",
-      "sha256": "1F4313BE8D067538586CA287C9E278B874A855F24D9CA6B1396BD1047B81D573"
+      "url": "https://github.com/worryeed/ClubSender/releases/download/v1.0.27/ClubSender.exe",
+      "sha256": "57D494CEA599E0AECBD72800CEB56642E477EC0264F03665C693900E56A98A11"
     }
   }
 }
