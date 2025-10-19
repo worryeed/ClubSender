@@ -254,9 +254,63 @@ class UpdateManager:
                         for k in ('PYTHONHOME','PYTHONPATH','PYTHONUSERBASE','PYTHONNOUSERSITE','PYTHONEXECUTABLE','_MEIPASS','_MEIPASS2'):
                             env.pop(k, None)
                         subprocess.Popen(cmd, creationflags=flags, cwd=str(exe.parent), startupinfo=si, close_fds=True, env=env)
+                        return True
                     except Exception as e2:
-                        log.error(f"[update] direct Popen failed: {e2}")
-                        return False
+                        log.error(f"[update] direct PS launch failed: {e2}; trying .bat fallback")
+                        # --- Fallback 1: plain .bat updater (no PowerShell) ---
+                        try:
+                            bat_path = exe.parent / "clubsender_update.bat"
+                            bat_content = (
+                                "@echo off\r\n"
+                                "setlocal enableextensions\r\n"
+                                "set NEW=%1\r\n"
+                                "set TARGET=%2\r\n"
+                                ":waitloop\r\n"
+                                "timeout /t 1 /nobreak >nul\r\n"
+                                "(del /f /q \"%TARGET%\") >nul 2>&1\r\n"
+                                "if exist \"%TARGET%\" goto waitloop\r\n"
+                                "move /y \"%NEW%\" \"%TARGET%\" >nul 2>&1\r\n"
+                                "start \"\" \"%TARGET%\"\r\n"
+                                "endlocal\r\n"
+                                "exit\r\n"
+                            )
+                            try:
+                                bat_path.write_text(bat_content, encoding="utf-8")
+                            except Exception:
+                                # fallback to temp dir if cannot write next to exe
+                                bat_path = Path(tempfile.gettempdir()) / "clubsender_update.bat"
+                                bat_path.write_text(bat_content, encoding="utf-8")
+                            bat_cmd = [os.environ.get('COMSPEC','cmd'), '/c', 'start', '', str(bat_path), str(new_file), str(exe)]
+                            log.info(f"[update] .bat fallback launch: {' '.join(map(str, bat_cmd))}")
+                            env2 = os.environ.copy()
+                            for k in ('PYTHONHOME','PYTHONPATH','PYTHONUSERBASE','PYTHONNOUSERSITE','PYTHONEXECUTABLE','_MEIPASS','_MEIPASS2'):
+                                env2.pop(k, None)
+                            subprocess.Popen(bat_cmd, creationflags=flags, cwd=str(exe.parent), startupinfo=si, close_fds=True, env=env2)
+                            return True
+                        except Exception as e_bat:
+                            log.error(f"[update] .bat fallback failed: {e_bat}; trying schtasks fallback")
+                            # --- Fallback 2: schedule a one-shot task to run the .bat ---
+                            try:
+                                import datetime
+                                # ensure bat exists
+                                if 'bat_path' not in locals() or not Path(bat_path).exists():
+                                    bat_path = Path(tempfile.gettempdir()) / "clubsender_update.bat"
+                                    bat_path.write_text(bat_content, encoding="utf-8")
+                                task_name = f"ClubSenderUpdate_{os.getpid()}"
+                                run_time = (datetime.datetime.now() + datetime.timedelta(seconds=30)).strftime("%H:%M")
+                                tr = f'"{bat_path}" "{new_file}" "{exe}"'
+                                log.info(f"[update] Scheduling task {task_name} at {run_time} -> {tr}")
+                                # Create
+                                subprocess.check_call([
+                                    'schtasks', '/Create', '/SC', 'ONCE', '/ST', run_time,
+                                    '/TN', task_name, '/TR', tr, '/F'
+                                ])
+                                # Run immediately
+                                subprocess.check_call(['schtasks', '/Run', '/TN', task_name])
+                                return True
+                            except Exception as e_task:
+                                log.error(f"[update] schtasks fallback failed: {e_task}")
+                                return False
                 return True
             except Exception as e:
                 log.error(f"[update] Install (Windows) failed: {e}")
