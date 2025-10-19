@@ -191,28 +191,21 @@ class UpdateManager:
             try:
                 tmp_ps1 = Path(tempfile.gettempdir()) / f"clubsender_update_{int(time.time())}.ps1"
                 ps_script = (
-                    "param([string]$New,[string]$Target,[int]$ProcId,[string]$LogDir)\r\n"
+                    "param([string]$New,[string]$Target,[string]$LogDir)\r\n"
                     "$ErrorActionPreference='SilentlyContinue'\r\n"
                     "if(!(Test-Path -LiteralPath $LogDir)){New-Item -ItemType Directory -Force -Path $LogDir | Out-Null}\r\n"
                     "$Log = Join-Path $LogDir 'updater.log'\r\n"
                     "function Log($m){ Add-Content -Path $Log -Value (\"[{0}] {1}\" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'), $m) }\r\n"
-                    "Log (\"Start. NEW=\"\"{0}\"\" TARGET=\"\"{1}\"\" PID={2}\" -f $New,$Target,$ProcId)\r\n"
-                    "if($ProcId -gt 0){ try{ Wait-Process -Id $ProcId -ErrorAction SilentlyContinue } catch{ Log (\"Wait-Process error: \" + $_) } }\r\n"
+                    "Log (\"Start. NEW=\"\"{0}\"\" TARGET=\"\"{1}\"\"\" -f $New,$Target)\r\n"
                     "Log 'Replacing target...'\r\n"
-                    "$ok=$false; for($i=0;$i -lt 120 -and -not $ok;$i++){ try{ Copy-Item -Force -LiteralPath $New -Destination $Target; $ok=$true } catch{ Start-Sleep -Milliseconds 500 } }\r\n"
+                    "$ok=$false; for($i=0;$i -lt 240 -and -not $ok;$i++){ try{ Copy-Item -Force -LiteralPath $New -Destination $Target; $ok=$true } catch{ Start-Sleep -Milliseconds 500 } }\r\n"
                     "if(-not $ok){ Log 'Copy failed after retries' }\r\n"
                     "$wd = Split-Path -Parent $Target\r\n"
                     "Log 'Starting new binary (primary)...'\r\n"
                     "$proc = $null\r\n"
                     "try{ $proc = Start-Process -FilePath $Target -WorkingDirectory $wd -WindowStyle Hidden -PassThru } catch { Log (\"Start-Process error: \" + $_) }\r\n"
-                    "Start-Sleep -Milliseconds 400\r\n"
-                    "$started = $false\r\n"
-                    "if($proc -and $proc.Id){ try{ if(Get-Process -Id $proc.Id -ErrorAction SilentlyContinue){ $started = $true } } catch {} }\r\n"
-                    "if(-not $started){\r\n"
-                    "  Log 'Primary start not confirmed, trying fallback via cmd /c start'\r\n"
-                    "  try{ Start-Process -FilePath cmd.exe -ArgumentList @('/c','start','\"\"',$Target) -WorkingDirectory $wd -WindowStyle Hidden | Out-Null; $started=$true } catch { Log (\"Fallback start error: \" + $_) }\r\n"
-                    "}\r\n"
-                    "Log ('Done. started={0}' -f $started)\r\n"
+                    "Start-Sleep -Milliseconds 500\r\n"
+                    "Log ('Done. started_pid={0}' -f ($proc.Id))\r\n"
                     "try{ Remove-Item -LiteralPath $New -Force } catch{}\r\n"
                     "try{ Remove-Item -LiteralPath $PSCommandPath -Force } catch{}\r\n"
                 )
@@ -230,90 +223,36 @@ class UpdateManager:
                 if not ps:
                     log.error("[update] Cannot locate PowerShell executable")
                     return False
+                # Build PowerShell command (used as fallback)
                 cmd = [
                     ps, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(tmp_ps1),
-                    "-New", str(new_file), "-Target", str(exe), "-ProcId", str(pid), "-LogDir", str(log_dir)
+                    "-New", str(new_file), "-Target", str(exe), "-LogDir", str(log_dir)
                 ]
-                log.info(f"[update] Launching updater: {' '.join(map(str, cmd))}")
-                # Creation flags: detach from job and session; hide window unless debug requested
-                flags = 0
-                for _f in ('DETACHED_PROCESS', 'CREATE_NEW_PROCESS_GROUP', 'CREATE_BREAKAWAY_FROM_JOB'):
-                    flags |= getattr(subprocess, _f, 0)
-                show_console = (os.environ.get('XP_UPDATER_DEBUG','').strip().lower() in ('1','true','yes'))
-                if not show_console:
-                    flags |= getattr(subprocess, 'CREATE_NO_WINDOW', 0)
-                # startup info
-                si = None
+                log.info(f"[update] Prepared updater cmd: {' '.join(map(str, cmd))}")
+                # Prepare .bat updater (primary for scheduling)
+                bat_path = exe.parent / "clubsender_update.bat"
+                bat_content = (
+                    "@echo off\r\n"
+                    "setlocal enableextensions\r\n"
+                    "set NEW=%1\r\n"
+                    "set TARGET=%2\r\n"
+                    ":waitloop\r\n"
+                    "timeout /t 1 /nobreak >nul\r\n"
+                    "(del /f /q \"%TARGET%\") >nul 2>&1\r\n"
+                    "if exist \"%TARGET%\" goto waitloop\r\n"
+                    "move /y \"%NEW%\" \"%TARGET%\" >nul 2>&1\r\n"
+                    "start \"\" \"%TARGET%\"\r\n"
+                    "endlocal\r\n"
+                    "exit\r\n"
+                )
                 try:
-                    si = subprocess.STARTUPINFO()
-                    if not show_console:
-                        si.dwFlags |= getattr(subprocess, 'STARTF_USESHOWWINDOW', 0)
-                        si.wShowWindow = 0
+                    bat_path.write_text(bat_content, encoding="utf-8")
                 except Exception:
-                    si = None
-                # 1) Try direct PowerShell launch (preferred)
-                try:
-                    env = os.environ.copy()
-                    for k in ('PYTHONHOME','PYTHONPATH','PYTHONUSERBASE','PYTHONNOUSERSITE','PYTHONEXECUTABLE','_MEIPASS','_MEIPASS2'):
-                        env.pop(k, None)
-                    p = subprocess.Popen(cmd, creationflags=flags, cwd=str(exe.parent), startupinfo=si, close_fds=True, env=env)
-                    log.info(f"[update] Direct PowerShell spawn OK (pid={getattr(p, 'pid', '?')})")
-                    return True
-                except Exception as e:
-                    log.error(f"[update] direct PowerShell failed: {e}; trying cmd /c start")
-                # 2) Fallback: cmd /c start (optionally hidden/minimized)
-                try:
-                    start_args = [os.environ.get('COMSPEC', 'cmd'), '/c', 'start']
-                    if show_console:
-                        start_args += ['""']  # visible window
-                    else:
-                        start_args += ['/b', '/min', '""']
-                    start_cmd = start_args + [cmd[0]] + cmd[1:]
-                    log.info(f"[update] Launch via cmd: {' '.join(map(str, start_cmd))}")
-                    env = os.environ.copy()
-                    for k in ('PYTHONHOME','PYTHONPATH','PYTHONUSERBASE','PYTHONNOUSERSITE','PYTHONEXECUTABLE','_MEIPASS','_MEIPASS2'):
-                        env.pop(k, None)
-                    subprocess.Popen(start_cmd, creationflags=flags, cwd=str(exe.parent), startupinfo=si, close_fds=True, env=env)
-                    return True
-                except Exception as e:
-                    log.error(f"[update] cmd-start failed: {e}; trying .bat fallback")
-                # 3) Fallback: plain .bat updater (no PowerShell)
-                try:
-                    bat_path = exe.parent / "clubsender_update.bat"
-                    bat_content = (
-                        "@echo off\r\n"
-                        "setlocal enableextensions\r\n"
-                        "set NEW=%1\r\n"
-                        "set TARGET=%2\r\n"
-                        ":waitloop\r\n"
-                        "timeout /t 1 /nobreak >nul\r\n"
-                        "(del /f /q \"%TARGET%\") >nul 2>&1\r\n"
-                        "if exist \"%TARGET%\" goto waitloop\r\n"
-                        "move /y \"%NEW%\" \"%TARGET%\" >nul 2>&1\r\n"
-                        "start \"\" \"%TARGET%\"\r\n"
-                        "endlocal\r\n"
-                        "exit\r\n"
-                    )
-                    try:
-                        bat_path.write_text(bat_content, encoding="utf-8")
-                    except Exception:
-                        bat_path = Path(tempfile.gettempdir()) / "clubsender_update.bat"
-                        bat_path.write_text(bat_content, encoding="utf-8")
-                    bat_cmd = [os.environ.get('COMSPEC','cmd'), '/c', 'start', '""', str(bat_path), str(new_file), str(exe)]
-                    log.info(f"[update] .bat fallback launch: {' '.join(map(str, bat_cmd))}")
-                    env2 = os.environ.copy()
-                    for k in ('PYTHONHOME','PYTHONPATH','PYTHONUSERBASE','PYTHONNOUSERSITE','PYTHONEXECUTABLE','_MEIPASS','_MEIPASS2'):
-                        env2.pop(k, None)
-                    subprocess.Popen(bat_cmd, creationflags=flags, cwd=str(exe.parent), startupinfo=si, close_fds=True, env=env2)
-                    return True
-                except Exception as e_bat:
-                    log.error(f"[update] .bat fallback failed: {e_bat}; trying schtasks fallback")
-                # 4) Fallback: schedule a one-shot task to run the .bat
+                    bat_path = Path(tempfile.gettempdir()) / "clubsender_update.bat"
+                    bat_path.write_text(bat_content, encoding="utf-8")
+                # Primary: schedule .bat outside job
                 try:
                     import datetime
-                    if 'bat_path' not in locals() or not Path(bat_path).exists():
-                        bat_path = Path(tempfile.gettempdir()) / "clubsender_update.bat"
-                        bat_path.write_text(bat_content, encoding="utf-8")
                     task_name = f"ClubSenderUpdate_{os.getpid()}"
                     run_time = (datetime.datetime.now() + datetime.timedelta(seconds=30)).strftime("%H:%M")
                     tr = f'"{bat_path}" "{new_file}" "{exe}"'
@@ -322,7 +261,41 @@ class UpdateManager:
                     subprocess.check_call(['schtasks', '/Run', '/TN', task_name])
                     return True
                 except Exception as e_task:
-                    log.error(f"[update] schtasks fallback failed: {e_task}")
+                    log.error(f"[update] schtasks primary failed: {e_task}; trying PowerShell direct")
+                # Fallback 1: direct PowerShell spawn
+                try:
+                    flags = 0
+                    for _f in ('DETACHED_PROCESS', 'CREATE_NEW_PROCESS_GROUP', 'CREATE_BREAKAWAY_FROM_JOB'):
+                        flags |= getattr(subprocess, _f, 0)
+                    show_console = (os.environ.get('XP_UPDATER_DEBUG','').strip().lower() in ('1','true','yes'))
+                    if not show_console:
+                        flags |= getattr(subprocess, 'CREATE_NO_WINDOW', 0)
+                    else:
+                        flags |= getattr(subprocess, 'CREATE_NEW_CONSOLE', 0)
+                    si = None
+                    try:
+                        si = subprocess.STARTUPINFO()
+                        if not show_console:
+                            si.dwFlags |= getattr(subprocess, 'STARTF_USESHOWWINDOW', 0)
+                            si.wShowWindow = 0
+                    except Exception:
+                        si = None
+                    env = os.environ.copy()
+                    for k in ('PYTHONHOME','PYTHONPATH','PYTHONUSERBASE','PYTHONNOUSERSITE','PYTHONEXECUTABLE','_MEIPASS','_MEIPASS2'):
+                        env.pop(k, None)
+                    p = subprocess.Popen(cmd, creationflags=flags, cwd=str(exe.parent), startupinfo=si, close_fds=True, env=env)
+                    log.info(f"[update] Direct PowerShell spawn OK (pid={getattr(p, 'pid', '?')})")
+                    return True
+                except Exception as e:
+                    log.error(f"[update] PowerShell direct failed: {e}; trying cmd /c start .bat")
+                # Fallback 2: cmd /c start .bat
+                try:
+                    start_cmd = [os.environ.get('COMSPEC','cmd'), '/c', 'start', '""', str(bat_path), str(new_file), str(exe)]
+                    log.info(f"[update] .bat fallback launch: {' '.join(map(str, start_cmd))}")
+                    subprocess.Popen(start_cmd, cwd=str(exe.parent))
+                    return True
+                except Exception as e_bat:
+                    log.error(f"[update] .bat start failed: {e_bat}")
                     return False
             except Exception as e:
                 log.error(f"[update] Install (Windows) failed: {e}")
