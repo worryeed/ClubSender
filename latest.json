@@ -1,10 +1,10 @@
 {
-  "version": "1.0.21",
-  "notes": "Версия 1.0.21: минорные улучшения, основано на 1.0.20.",
+  "version": "1.0.22",
+  "notes": "Версия 1.0.22: запуск апдейтера через абсолютный путь к PowerShell (fallback pwsh), создание logs, лог команды запуска.",
   "assets": {
     "windows": {
-      "url": "https://github.com/worryeed/ClubSender/releases/download/v1.0.21/ClubSender.exe",
-      "sha256": "C3CB3AFAD7B9C8E0B6B25A96F3E7B06DB8397DED3EA0A9A5603D015AC3490709"
+      "url": "https://github.com/worryeed/ClubSender/releases/download/v1.0.22/ClubSender.exe",
+      "sha256": "EC66786CA82BB436692ED707139BAF05AC86BDAFBF07FDC81B1C7688DA66345F"
     }
   }
 }
