@@ -1,10 +1,10 @@
 {
-  "version": "1.0.2",
-  "notes": "Обновлён автообновлятор: одно уведомление, асинхронная загрузка без фризов, автоперезапуск.",
+  "version": "1.0.41",
+  "notes": "Повышен лимит клубов на аккаунт до 1,000,000; исправлен импорт аккаунтов; улучшена логика обновлений.",
   "assets": {
     "windows": {
-      "url": "https://github.com/worryeed/ClubSender/releases/download/v1.0.2/ClubSender.exe",
-      "sha256": "EA1AA8535B61E248C540DB120553E05A292E9EEA4002FD0E95F93D9B4575B1D2"
+      "url": "https://github.com/worryeed/ClubSender/releases/download/v1.0.41/ClubSender.exe",
+      "sha256": "2B285BB18565104839F99A54CD3533FB5E121029E57C0E109CC0855BC1BCFC2F"
     }
   }
 }
