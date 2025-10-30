@@ -698,7 +698,7 @@ class MainWindow(QMainWindow):
 
         knobs = QHBoxLayout()
         knobs.addWidget(QLabel("Клубов на аккаунт (0 = все клубы):"))
-        self.spn_clubs_per_account = QSpinBox(); self.spn_clubs_per_account.setRange(0, 10000); self.spn_clubs_per_account.setValue(500)
+        self.spn_clubs_per_account = QSpinBox(); self.spn_clubs_per_account.setRange(0, 1000000); self.spn_clubs_per_account.setValue(500)
         knobs.addWidget(self.spn_clubs_per_account)
         knobs.addWidget(QLabel("Задержка мин (мс):"))
         self.spn_delay_min = QSpinBox(); self.spn_delay_min.setRange(0, 10000); self.spn_delay_min.setValue(500)
@@ -810,13 +810,14 @@ class MainWindow(QMainWindow):
             pass
 
     def on_load_accounts(self):
+        """Загрузить аккаунты из Excel файла."""
         path, _ = QFileDialog.getOpenFileName(self, "Выберите файл с аккаунтами", "", "Excel (*.xlsx)")
         if not path:
             return
         df = pd.read_excel(path)
-        
+
         df.columns = [str(col).lower().strip() for col in df.columns]
-        
+
         # Требуем только username и password, остальные поля опциональны
         need_cols = {"username", "password"}
         missing = need_cols - set(df.columns)
@@ -831,10 +832,10 @@ class MainWindow(QMainWindow):
                 proxy_val = None
             else:
                 proxy_val = str(proxy_val).strip()
-            
+
             device_id_val = row.get("device_id")
             device_id_str = str(device_id_val).strip() if device_id_val is not None and not pd.isna(device_id_val) else ""
-            
+
             acc = Account(
                 username=str(row["username"]).strip(),
                 password=str(row["password"]).strip(),
