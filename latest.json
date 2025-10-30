@@ -1,10 +1,10 @@
 {
-  "version": "1.0.40",
-  "notes": "Версия 1.0.40: ребрендинг — заголовок окна ClubSender.",
+  "version": "1.0.2",
+  "notes": "Обновлён автообновлятор: одно уведомление, асинхронная загрузка без фризов, автоперезапуск.",
   "assets": {
     "windows": {
-      "url": "https://github.com/worryeed/ClubSender/releases/download/v1.0.40/ClubSender.exe",
-      "sha256": "DD75D16DA03C79F30DE40F46F0EA6CD00FB17E46A6B276A2117F90306A9D5C45"
+      "url": "https://github.com/worryeed/ClubSender/releases/download/v1.0.2/ClubSender.exe",
+      "sha256": "EA1AA8535B61E248C540DB120553E05A292E9EEA4002FD0E95F93D9B4575B1D2"
     }
   }
 }
