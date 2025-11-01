@@ -1,10 +1,10 @@
-{
-  "version": "1.0.41",
-  "notes": "Повышен лимит клубов на аккаунт до 1,000,000; исправлен импорт аккаунтов; улучшена логика обновлений.",
-  "assets": {
-    "windows": {
-      "url": "https://github.com/worryeed/ClubSender/releases/download/v1.0.41/ClubSender.exe",
-      "sha256": "2B285BB18565104839F99A54CD3533FB5E121029E57C0E109CC0855BC1BCFC2F"
-    }
-  }
+﻿{
+    "version":  "1.0.42",
+    "assets":  {
+                   "windows":  {
+                                   "sha256":  "BC540FE2978C2794017C44CB980CE3865D7561D5CE43A874935CE7CC38356C20",
+                                   "url":  "https://github.com/worryeed/ClubSender/releases/download/v1.0.42/ClubSender.exe"
+                               }
+               },
+    "notes":  "PPPoker: новая вкладка и ядро (HTTP+TCP); полное соответствие UI XPoker; тема в статус-баре; фикс сохранений; IMEI 40-hex; улучшения отмены/паузы."
 }
