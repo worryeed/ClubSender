@@ -1,10 +1,10 @@
-﻿{
-    "version":  "1.0.42",
-    "assets":  {
-                   "windows":  {
-                                   "sha256":  "BC540FE2978C2794017C44CB980CE3865D7561D5CE43A874935CE7CC38356C20",
-                                   "url":  "https://github.com/worryeed/ClubSender/releases/download/v1.0.42/ClubSender.exe"
-                               }
-               },
-    "notes":  "PPPoker: новая вкладка и ядро (HTTP+TCP); полное соответствие UI XPoker; тема в статус-баре; фикс сохранений; IMEI 40-hex; улучшения отмены/паузы."
+{
+  "version": "1.1.0",
+  "notes": "PPPoker GA: вкладка и ядро (HTTP+TCP); полное соответствие UI XPoker; тема в статус-баре; сохранения; IMEI 40-hex; улучшения отмены/паузы.",
+  "assets": {
+    "windows": {
+      "url": "https://github.com/worryeed/ClubSender/releases/download/v1.1.0/ClubSender.exe",
+      "sha256": "D85695F7E7750188820FB0518834EAE7450530E07FC71E6937E50E1ED48DBC0C"
+    }
+  }
 }
