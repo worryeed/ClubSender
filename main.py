@@ -46,15 +46,7 @@ EXTRA_COLUMNS = ["Прогресс", "Статус", "Текущий клуб"]
 REPORT_COLUMNS = ["Время", "Имя пользователя", "ID клуба", "Успешно", "Сообщение"]
 
 class Worker(QThread):
-    log = pyqtSignal(str)
-    account_updated = pyqtSignal(int, list)
-    join_result = pyqtSignal(object)
-    task_finished = pyqtSignal()  # Сигнал о завершении задачи
-    pause_changed = pyqtSignal(bool)  # Сигнал об изменении состояния паузы
-    # username, done, total, status_text, current_club
-    account_progress = pyqtSignal(str, int, int, str, str)
-
-    def __init__(self, accounts: List[Account], parent=None):
+    def __init__(self, accounts: List[Account], parent=None, *, api_class=XPokerAPI, api_error_class=ApiError):
         super().__init__(parent)
         self.accounts = accounts
         self._task = None
@@ -75,6 +67,18 @@ class Worker(QThread):
         # Событие отмены для быстрого прерывания сетевых ожиданий
         import threading as _th
         self._cancel_event = _th.Event()
+        # Инъекция провайдера API
+        self.api_class = api_class
+        self.api_error_class = api_error_class
+
+    log = pyqtSignal(str)
+    account_updated = pyqtSignal(int, list)
+    join_result = pyqtSignal(object)
+    task_finished = pyqtSignal()  # Сигнал о завершении задачи
+    pause_changed = pyqtSignal(bool)  # Сигнал об изменении состояния паузы
+    # username, done, total, status_text, current_club
+    account_progress = pyqtSignal(str, int, int, str, str)
+
 
     def stop(self):
         self._stop = True
@@ -122,7 +126,7 @@ class Worker(QThread):
             try:
                 proxy_info = acc.proxy or 'без прокси'
                 self.log.emit(f"{Icons.AUTH} [{acc.username}] Авторизация через {proxy_info}")
-                api = XPokerAPI(proxy=acc.proxy)
+                api = self.api_class(proxy=acc.proxy)
                 
                 # Генерируем device_id если отсутствует
                 if not acc.device_id:
@@ -161,7 +165,7 @@ class Worker(QThread):
                 self.account_updated.emit(idx, acc.as_row())
                 token_status = 'получен' if token else 'отсутствует'
                 self.log.emit(format_login_step(acc.username, "Авторизация завершена", bool(token), f"токен {token_status}"))
-            except ApiError as e:
+            except self.api_error_class as e:
                 self.log.emit(format_login_step(acc.username, "Ошибка API", False, str(e)))
             except Exception as e:
                 self.log.emit(format_login_step(acc.username, "Ошибка авторизации", False, str(e)))
@@ -175,7 +179,7 @@ class Worker(QThread):
                 self.log.emit(f"{Icons.WARNING} [{acc.username}] Выход: нет токена")
                 continue
             try:
-                api = XPokerAPI(proxy=acc.proxy)
+                api = self.api_class(proxy=acc.proxy)
                 api.logout(acc.token)
                 acc.token = None
                 self.account_updated.emit(r, acc.as_row())
@@ -268,7 +272,7 @@ class Worker(QThread):
                 if not acc.uid:
                     self.log.emit(f"{Icons.ERROR} [{acc.username}] UID отсутствует — пропуск аккаунта")
                     return
-                api = XPokerAPI(proxy=acc.proxy)
+                api = self.api_class(proxy=acc.proxy)
                 api.token = acc.token
                 api.refresh_token = acc.refresh_token
                 # Колбэк прогресса для остановки/паузы
@@ -614,6 +618,747 @@ class UpdateDownloadThread(QThread):
             self.finished.emit(False, "download_failed")
 
 
+class PPPokerTab(QWidget):
+    def update_table_theme(self) -> None:
+        """Светлая/тёмная тема таблицы — как у XPoker, но селекторы без id для строгого применения."""
+        try:
+            t = self.tbl
+        except Exception:
+            return
+        if not isinstance(t, QTableWidget):
+            return
+        # Определяем эффективный режим темы из окна (QTabWidget может переписать parent)
+        eff = 'light'
+        try:
+            mw = self.window()
+            if not (mw and hasattr(mw, 'current_theme_mode')):
+                # Поищем выше по иерархии
+                p = self.parent()
+                while p is not None and not hasattr(p, 'current_theme_mode'):
+                    p = getattr(p, 'parent', lambda: None)()
+                if p is not None:
+                    mw = p
+            if mw and getattr(mw, 'current_theme_mode', None) in ('light', 'dark'):
+                eff = mw.current_theme_mode
+        except Exception:
+            pass
+        if eff == 'dark':
+            try:
+                t.setStyleSheet(
+                    "QTableWidget, QTableView, QTableWidget::viewport, QTableView::viewport {"
+                    " background-color: #1e1e1e;"
+                    "}"
+                    "QTableCornerButton::section {"
+                    " background-color: #1e1e1e;"
+                    "}"
+                )
+                t.viewport().setStyleSheet("background-color: #1e1e1e;")
+            except Exception:
+                pass
+            try:
+                vh = t.verticalHeader()
+                if vh is not None:
+                    vh.setStyleSheet(
+                        "QHeaderView { background-color: #1e1e1e; }"
+                        "QHeaderView::section { background-color: #1e1e1e; color: #d0d0d0; border: none; }"
+                    )
+                    pal = vh.palette()
+                    pal.setColor(QPalette.ColorRole.Button, QColor("#1e1e1e"))
+                    pal.setColor(QPalette.ColorRole.Window, QColor("#1e1e1e"))
+                    pal.setColor(QPalette.ColorRole.Base, QColor("#1e1e1e"))
+                    vh.setPalette(pal)
+                    vh.setAutoFillBackground(True)
+            except Exception:
+                pass
+        else:
+            try:
+                # Сбрасываем QSS/палитры
+                t.setStyleSheet("")
+                t.viewport().setStyleSheet("")
+                try:
+                    pal = QApplication.palette()
+                    t.setPalette(pal)
+                    t.viewport().setAutoFillBackground(False)
+                except Exception:
+                    pass
+                # Хедеры
+                vh = t.verticalHeader()
+                if vh is not None:
+                    vh.setStyleSheet("")
+                    vh.setAutoFillBackground(False)
+                    try:
+                        vh.setPalette(QApplication.palette())
+                    except Exception:
+                        pass
+                hh = t.horizontalHeader()
+                if hh is not None:
+                    hh.setStyleSheet("")
+                    try:
+                        hh.setPalette(QApplication.palette())
+                    except Exception:
+                        pass
+                # Стиль как у XPoker (без id)
+                ss_light = (
+                    "QTableWidget, QTableWidget::viewport {"
+                    " background-color: #f7f7f7;"
+                    " alternate-background-color: #ffffff;"
+                    "}"
+                    "QTableWidget {"
+                    " gridline-color: #e0e0e0;"
+                    "}"
+                    "QHeaderView::section:horizontal {"
+                    " background-color: #fafafa; color: #222; border: 1px solid #e6e6e6; padding: 4px;"
+                    "}"
+                    "QHeaderView::section:vertical {"
+                    " background-color: #f7f7f7; color: #666; border: none;"
+                    "}"
+                    "QTableCornerButton::section {"
+                    " background-color: #fafafa; border: 1px solid #e6e6e6;"
+                    "}"
+                    "QTableWidget::item:selected {"
+                    " background-color: #cfe8ff; color: #000;"
+                    "}"
+                )
+                try:
+                    t.setAlternatingRowColors(True)
+                except Exception:
+                    pass
+                try:
+                    t.setStyleSheet(ss_light)
+                except Exception:
+                    pass
+                try:
+                    t.style().unpolish(t)
+                    t.style().polish(t)
+                    t.update()
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+    def _imei40(self, seed: str) -> str:
+        try:
+            import hashlib
+            s = (seed or '').replace('-', '').strip()
+            if not s:
+                s = 'pppoker'
+            return hashlib.sha1(s.encode('utf-8')).hexdigest()
+        except Exception:
+            # Фолбэк на фиксированное значение
+            return 'd98cc29319f8ff44f171963a3f959a0c07803c4a'
+
+    def _ensure_imei(self, value: str, username: str) -> str:
+        import re
+        v = (value or '').strip()
+        if re.fullmatch(r'[0-9a-fA-F]{40}', v):
+            return v.lower()
+        # если это UUID — уберём дефисы и захешируем; иначе возьмём username
+        seed = v if v else username
+        return self._imei40(seed)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        from pppoker.api import PPPokerAPI, ApiError as PPPApiError
+        # State
+        self.accounts: List[Account] = []
+        self.club_ids: List[str] = []
+        self.report_rows: List[dict] = []
+        self.account_row_by_username: Dict[str, int] = {}
+        self._suppress_item_changed = False
+
+        # Layout
+        v = QVBoxLayout(self)
+
+        # Accounts group
+        accounts_group = QGroupBox("📋 Управление аккаунтами")
+        accounts_layout = QHBoxLayout(accounts_group)
+        self.btn_add_account = QPushButton("➕ Добавить аккаунт")
+        self.btn_edit_account = QPushButton("✏️ Редактировать")
+        self.btn_delete_account = QPushButton("🗑️ Удалить")
+        self.btn_load_accounts = QPushButton("📁 Из Excel файла")
+        self.btn_save_accounts = QPushButton("💾 Сохранить настройки")
+        for b in (self.btn_add_account, self.btn_edit_account, self.btn_delete_account, self.btn_load_accounts, self.btn_save_accounts):
+            accounts_layout.addWidget(b)
+        accounts_layout.addStretch()
+        v.addWidget(accounts_group)
+
+        # Clubs group
+        clubs_group = QGroupBox("🏛️ Управление клубами")
+        clubs_layout = QHBoxLayout(clubs_group)
+        self.btn_add_clubs = QPushButton("➕ Добавить клубы")
+        self.btn_clear_clubs = QPushButton("🗑️ Очистить список")
+        self.btn_load_clubs = QPushButton("📁 Из Excel файла")
+        self.btn_load_club_distribution = QPushButton("📊 Распределение клубов")
+        self.clubs_count_label = QLabel("Клубов: 0")
+        for b in (self.btn_add_clubs, self.btn_clear_clubs, self.btn_load_clubs, self.btn_load_club_distribution):
+            clubs_layout.addWidget(b)
+        clubs_layout.addWidget(self.clubs_count_label)
+        clubs_layout.addStretch()
+        v.addWidget(clubs_group)
+
+        # Operations group
+        operations_group = QGroupBox("🚀 Операции")
+        operations_layout = QHBoxLayout(operations_group)
+        self.btn_login = QPushButton("🔐 Войти во все")
+        self.btn_logout = QPushButton("🚪 Выйти из выбранных")
+        self.btn_join = QPushButton("🎯 Начать вступление")
+        self.btn_pause = QPushButton("⏸ Пауза"); self.btn_pause.setEnabled(False)
+        self.btn_stop = QPushButton("🛑 Остановить"); self.btn_stop.setEnabled(False)
+        self.btn_export = QPushButton("📊 Экспорт отчета")
+        for b in (self.btn_login, self.btn_logout, self.btn_join, self.btn_pause, self.btn_stop, self.btn_export):
+            operations_layout.addWidget(b)
+        operations_layout.addStretch()
+        v.addWidget(operations_group)
+
+        # Knobs
+        knobs = QHBoxLayout()
+        knobs.addWidget(QLabel("Клубов на аккаунт (0 = все клубы):"))
+        self.spn_clubs_per_account = QSpinBox(); self.spn_clubs_per_account.setRange(0, 1000000); self.spn_clubs_per_account.setValue(500)
+        knobs.addWidget(self.spn_clubs_per_account)
+        knobs.addWidget(QLabel("Задержка мин (мс):"))
+        self.spn_delay_min = QSpinBox(); self.spn_delay_min.setRange(0, 10000); self.spn_delay_min.setValue(500)
+        knobs.addWidget(self.spn_delay_min)
+        knobs.addWidget(QLabel("Задержка макс (мс):"))
+        self.spn_delay_max = QSpinBox(); self.spn_delay_max.setRange(0, 20000); self.spn_delay_max.setValue(1500)
+        knobs.addWidget(self.spn_delay_max)
+        self.chk_shuffle = QCheckBox("Перемешать ID клубов"); self.chk_shuffle.setChecked(True)
+        knobs.addWidget(self.chk_shuffle)
+        v.addLayout(knobs)
+
+        # Message field (40 chars)
+        msg_row = QHBoxLayout()
+        msg_row.addWidget(QLabel("Сообщение заявки (до 40 символов):"))
+        self.txt_message = QLineEdit(); self.txt_message.setMaxLength(40); self.txt_message.setPlaceholderText("Например: Примите, пожалуйста")
+        msg_row.addWidget(self.txt_message)
+        v.addLayout(msg_row)
+
+        # Accounts table
+        base_cols = len(ACCOUNTS_COLUMNS)
+        self.PROG_COL = base_cols + 0
+        self.STATUS_COL = base_cols + 1
+        self.CURRENT_COL = base_cols + 2
+        self.tbl = QTableWidget(0, base_cols + len(EXTRA_COLUMNS))
+        self.tbl.setObjectName("accountsTable")
+        self.tbl.setHorizontalHeaderLabels(ACCOUNTS_COLUMNS + EXTRA_COLUMNS)
+        self.tbl.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.tbl.itemChanged.connect(self.on_cell_changed)
+        v.addWidget(self.tbl, stretch=1)
+
+        v.addWidget(QLabel("Журнал событий:"))
+        self.log = QPlainTextEdit(); self.log.setReadOnly(True)
+        v.addWidget(self.log, stretch=1)
+
+        # Worker
+        self.worker = Worker(self.accounts, api_class=PPPokerAPI, api_error_class=PPPApiError)
+        self.worker.log.connect(self.on_worker_log)
+        self.worker.account_updated.connect(self.on_account_updated)
+        self.worker.join_result.connect(self.on_join_result)
+        self.worker.task_finished.connect(self.on_task_finished)
+        self.worker.pause_changed.connect(self.on_worker_pause_changed)
+        self.worker.account_progress.connect(self.on_account_progress)
+        # Управление состоянием кнопок как в XPoker
+        try:
+            self.worker.started.connect(self.on_worker_started)
+            self.worker.finished.connect(self.on_worker_finished)
+        except Exception:
+            pass
+
+        # Wire up buttons
+        self.btn_add_account.clicked.connect(self.on_add_account)
+        self.btn_edit_account.clicked.connect(self.on_edit_account)
+        self.btn_delete_account.clicked.connect(self.on_delete_account)
+        self.btn_load_accounts.clicked.connect(self.on_load_accounts)
+        self.btn_save_accounts.clicked.connect(self.on_save_accounts)
+        self.btn_add_clubs.clicked.connect(self.on_add_clubs)
+        self.btn_clear_clubs.clicked.connect(self.on_clear_clubs)
+        self.btn_load_clubs.clicked.connect(self.on_load_clubs)
+        self.btn_load_club_distribution.clicked.connect(self.on_load_club_distribution)
+        self.btn_login.clicked.connect(self.on_login_all)
+        self.btn_logout.clicked.connect(self.on_logout_selected)
+        self.btn_join.clicked.connect(self.on_join)
+        self.btn_pause.clicked.connect(self.on_pause)
+        self.btn_stop.clicked.connect(self.on_stop)
+        self.btn_export.clicked.connect(self.on_export_report)
+        # Auto-save UI knobs on change
+        try:
+            self.spn_clubs_per_account.valueChanged.connect(self.save_settings)
+            self.spn_delay_min.valueChanged.connect(self.save_settings)
+            self.spn_delay_max.valueChanged.connect(self.save_settings)
+            self.chk_shuffle.toggled.connect(self.save_settings)
+            self.txt_message.textChanged.connect(self.save_settings)
+        except Exception:
+            pass
+
+        # Load settings
+        self.load_settings()
+        # Apply table theme now and when main theme changes
+        try:
+            self.update_table_theme()
+        except Exception:
+            pass
+
+    # ====== Event handlers / helpers (PPPoker) ======
+    def on_worker_log(self, line: str):
+        self.log.appendPlainText(line)
+
+    def on_save_accounts(self):
+        try:
+            self.save_settings()
+            QMessageBox.information(self, "Сохранение", "Настройки сохранены успешно!")
+            self.log.appendPlainText(f"{Icons.SUCCESS} Настройки сохранены")
+        except Exception as e:
+            QMessageBox.critical(self, "Ошибка", f"Не удалось сохранить настройки: {e}")
+
+    def _append_account_row(self, acc: Account):
+        r = self.tbl.rowCount()
+        self.tbl.insertRow(r)
+        data = acc.as_row()
+        self._suppress_item_changed = True
+        try:
+            for c, v in enumerate(data):
+                it = QTableWidgetItem(str(v))
+                if c in (1, 4, 5):
+                    it.setFlags(it.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                self.tbl.setItem(r, c, it)
+            prog = QProgressBar(); prog.setRange(0,1); prog.setValue(0); prog.setTextVisible(True); prog.setFormat("0/0 (0%)")
+            self.tbl.setCellWidget(r, self.PROG_COL, prog)
+            st_it = QTableWidgetItem("⏳ Ожидание"); st_it.setFlags(st_it.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            self.tbl.setItem(r, self.STATUS_COL, st_it)
+            cur_it = QTableWidgetItem("-"); cur_it.setFlags(cur_it.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            self.tbl.setItem(r, self.CURRENT_COL, cur_it)
+        finally:
+            self._suppress_item_changed = False
+        self.account_row_by_username[acc.username.lower()] = r
+
+    def on_cell_changed(self, item: QTableWidgetItem):
+        if self._suppress_item_changed:
+            return
+        row = item.row(); col = item.column()
+        if row < 0 or row >= len(self.accounts):
+            return
+        acc = self.accounts[row]
+        text = item.text().strip()
+        if col in (1,4,5):
+            self._suppress_item_changed = True
+            try:
+                current = acc.as_row()[col]
+                item.setText(str(current))
+                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            finally:
+                self._suppress_item_changed = False
+            return
+        changed = False
+        if col == 0 and text and text != acc.username:
+            acc.username = text; changed = True
+        elif col == 2:
+            new_proxy = text or None
+            if new_proxy != (acc.proxy or None):
+                acc.proxy = new_proxy; changed = True
+        elif col == 3 and text != (acc.device_id or ""):
+            acc.device_id = self._ensure_imei(text, acc.username); changed = True
+            # Обновим ячейку нормализованным значением
+            self._suppress_item_changed = True
+            try:
+                it = QTableWidgetItem(acc.device_id)
+                it.setFlags(it.flags() | Qt.ItemFlag.ItemIsEditable)
+                self.tbl.setItem(row, 3, it)
+            finally:
+                self._suppress_item_changed = False
+        if changed:
+            acc.token = None; acc.last_login_at = None
+            self._suppress_item_changed = True
+            try:
+                tok_it = QTableWidgetItem(""); tok_it.setFlags(tok_it.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                self.tbl.setItem(row, 4, tok_it)
+                last_it = QTableWidgetItem(""); last_it.setFlags(last_it.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                self.tbl.setItem(row, 5, last_it)
+            finally:
+                self._suppress_item_changed = False
+            self.account_row_by_username = {a.username.lower(): i for i,a in enumerate(self.accounts)}
+            self.worker.accounts = self.accounts
+            self.save_settings()
+
+    def on_account_updated(self, row: int, data: list):
+        self._suppress_item_changed = True
+        try:
+            for col, val in enumerate(data):
+                it = QTableWidgetItem(str(val))
+                if col in (1, 4, 5):
+                    it.setFlags(it.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                self.tbl.setItem(row, col, it)
+            it_status = self.tbl.item(row, self.STATUS_COL)
+            if it_status:
+                it_status.setFlags(it_status.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            it_curr = self.tbl.item(row, self.CURRENT_COL)
+            if it_curr:
+                it_curr.setFlags(it_curr.flags() & ~Qt.ItemFlag.ItemIsEditable)
+        finally:
+            self._suppress_item_changed = False
+
+    def on_account_progress(self, username: str, done: int, total: int, status_text: str, current_club: str):
+        row = self.account_row_by_username.get(username.lower())
+        if row is None:
+            return
+        w = self.tbl.cellWidget(row, self.PROG_COL)
+        if isinstance(w, QProgressBar):
+            w.setRange(0, max(total,1))
+            w.setValue(max(0, min(done, total)))
+            percent = (0 if total == 0 else int((done/total)*100))
+            w.setFormat(f"{done}/{total} ({percent}%)")
+        it_status = QTableWidgetItem(status_text); it_status.setFlags(it_status.flags() & ~Qt.ItemFlag.ItemIsEditable)
+        self.tbl.setItem(row, self.STATUS_COL, it_status)
+        it_curr = QTableWidgetItem(current_club); it_curr.setFlags(it_curr.flags() & ~Qt.ItemFlag.ItemIsEditable)
+        self.tbl.setItem(row, self.CURRENT_COL, it_curr)
+
+    def on_join_result(self, jr: JoinResult):
+        self.report_rows.append(jr)
+
+    def on_add_account(self):
+        dialog = AccountDialog(parent=self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            data = dialog.get_account_data()
+            # Сразу формируем IMEI (40-hex)
+            imei = self._ensure_imei('', data['username'])
+            acc = Account(username=data['username'], password=data['password'], device_id=imei, proxy=data['proxy'])
+            self.accounts.append(acc)
+            self._append_account_row(acc)
+            self.worker.accounts = self.accounts
+            self.save_settings()
+            self.log.appendPlainText(f"{Icons.SUCCESS} Добавлен аккаунт: {acc.username}")
+
+    def on_edit_account(self):
+        rows = sorted({idx.row() for idx in self.tbl.selectedIndexes()})
+        if not rows:
+            QMessageBox.information(self, "Выбор", "Выберите строку для редактирования"); return
+        if len(rows) > 1:
+            QMessageBox.information(self, "Выбор", "Выберите только одну строку для редактирования"); return
+        row = rows[0]
+        if row >= len(self.accounts):
+            return
+        acc = self.accounts[row]
+        dialog = AccountDialog(account=acc, parent=self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            data = dialog.get_account_data()
+            acc.username = data['username']; acc.password = data['password']; acc.proxy = data['proxy']
+            acc.token = None; acc.last_login_at = None
+            for col, val in enumerate(acc.as_row()):
+                self.tbl.setItem(row, col, QTableWidgetItem(str(val)))
+            self.account_row_by_username[acc.username.lower()] = row
+            self.worker.accounts = self.accounts
+            self.save_settings()
+            self.log.appendPlainText(f"{Icons.SUCCESS} Отредактирован аккаунт: {acc.username}")
+
+    def on_delete_account(self):
+        rows = sorted({idx.row() for idx in self.tbl.selectedIndexes()}, reverse=True)
+        if not rows:
+            QMessageBox.information(self, "Выбор", "Выберите строки для удаления"); return
+        reply = QMessageBox.question(self, "Подтверждение", f"Удалить {len(rows)} аккаунт(ов)?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if reply == QMessageBox.StandardButton.Yes:
+            deleted = []
+            for r in rows:
+                if r < len(self.accounts):
+                    deleted.append(self.accounts[r].username)
+                    del self.accounts[r]; self.tbl.removeRow(r)
+            self.worker.accounts = self.accounts
+            self.save_settings()
+            if deleted:
+                self.log.appendPlainText(f"{Icons.SUCCESS} Удалены аккаунты: {', '.join(deleted)}")
+
+    def on_add_clubs(self):
+        dialog = ClubIdDialog(parent=self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            new_club_ids = dialog.get_club_ids()
+            if new_club_ids:
+                existing = set(self.club_ids)
+                added = []
+                for club_id in new_club_ids:
+                    if club_id not in existing:
+                        self.club_ids.append(club_id)
+                        existing.add(club_id)
+                        added.append(club_id)
+                if self.chk_shuffle.isChecked() and self.club_ids:
+                    import random; random.shuffle(self.club_ids)
+                    self.log.appendPlainText(f"{Icons.INFO} Список клубов перемешан")
+                self.update_clubs_count(); self.save_settings()
+                if added:
+                    self.log.appendPlainText(f"{Icons.SUCCESS} Добавлено {len(added)} новых клубов: {', '.join(added)}")
+                else:
+                    self.log.appendPlainText(f"{Icons.INFO} Все введённые клубы уже есть в списке")
+            else:
+                QMessageBox.information(self, "Данные", "Не введено ни одного корректного ID клуба")
+
+    def on_clear_clubs(self):
+        if self.club_ids:
+            reply = QMessageBox.question(self, "Подтверждение", f"Очистить список из {len(self.club_ids)} клубов?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            if reply == QMessageBox.StandardButton.Yes:
+                self.club_ids.clear(); self.update_clubs_count(); self.save_settings(); self.log.appendPlainText(f"{Icons.SUCCESS} Список клубов очищен")
+        else:
+            QMessageBox.information(self, "Список пуст", "Список клубов уже пуст")
+
+    def on_load_accounts(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Выберите файл с аккаунтами", "", "Excel (*.xlsx)")
+        if not path:
+            return
+        import pandas as pd
+        df = pd.read_excel(path)
+        df.columns = [str(c).lower().strip() for c in df.columns]
+        if not {"username", "password"}.issubset(df.columns):
+            QMessageBox.critical(self, "Ошибка", "Требуются колонки: username, password"); return
+        self.accounts.clear(); self.tbl.setRowCount(0)
+        for _, row in df.iterrows():
+            proxy_val = row.get("proxy"); proxy_val = (None if (pd.isna(proxy_val) or str(proxy_val).strip()=="") else str(proxy_val).strip())
+            device_id_val = row.get("device_id"); device_id_str = str(device_id_val).strip() if device_id_val is not None and not pd.isna(device_id_val) else ""
+            username = str(row['username']).strip()
+            imei = self._ensure_imei(device_id_str, username)
+            acc = Account(username=username, password=str(row['password']).strip(), proxy=proxy_val, device_id=imei)
+            self.accounts.append(acc); self._append_account_row(acc)
+        self.worker.accounts = self.accounts
+        self.save_settings()
+        self.log.appendPlainText(f"{Icons.SUCCESS} Загружено {len(self.accounts)} аккаунтов")
+
+    def on_load_clubs(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Выберите файл с клубами", "", "Excel (*.xlsx)")
+        if not path: return
+        import pandas as pd
+        df = pd.read_excel(path)
+        col = None
+        for c in df.columns:
+            if str(c).lower() in ("club_id","id","clubid"):
+                col = c; break
+        if not col:
+            QMessageBox.critical(self, "Ошибка", "Не найдена колонка 'club_id'"); return
+        self.club_ids = [str(x) for x in df[col].dropna().astype(str).tolist()]
+        if self.chk_shuffle.isChecked():
+            import random; random.shuffle(self.club_ids)
+        self.update_clubs_count(); self.save_settings()
+        self.log.appendPlainText(f"{Icons.SUCCESS} Загружено {len(self.club_ids)} ID клубов")
+
+    def on_load_club_distribution(self):
+        if not self.accounts:
+            QMessageBox.critical(self, "Ошибка", "Сначала загрузите аккаунты!"); return
+        path, _ = QFileDialog.getOpenFileName(self, "Выберите файл с распределением клубов", "", "Excel (*.xlsx)")
+        if not path: return
+        try:
+            import pandas as pd
+            df = pd.read_excel(path)
+            df.columns = [str(c).lower().strip() for c in df.columns]
+            username_col = clubs_count_col = None
+            for c in df.columns:
+                if str(c).lower() in ("username", "user", "имя пользователя", "логин", "аккаунт"):
+                    username_col = c
+                if str(c).lower() in ("clubs_count", "clubs", "количество клубов", "клубов", "count"):
+                    clubs_count_col = c
+            if not username_col or not clubs_count_col:
+                QMessageBox.critical(self, "Ошибка", "Не найдены нужные колонки в файле"); return
+            self.worker.account_club_limits.clear()
+            loaded = 0
+            for _, row in df.iterrows():
+                username = str(row[username_col]).strip()
+                try:
+                    clubs_count = int(row[clubs_count_col]); clubs_count = max(0, clubs_count)
+                except Exception:
+                    continue
+                if any(acc.username.lower()==username.lower() for acc in self.accounts):
+                    self.worker.account_club_limits[username.lower()] = clubs_count
+                    loaded += 1
+            if loaded == 0:
+                QMessageBox.warning(self, "Предупреждение", "Не найдено совпадений аккаунтов"); return
+            self.log.appendPlainText(f"{Icons.SUCCESS} Загружено распределение для {loaded} аккаунтов")
+        except Exception as e:
+            QMessageBox.critical(self, "Ошибка загрузки", str(e))
+
+    def on_login_all(self):
+        if not self.accounts:
+            QMessageBox.critical(self, "Ошибка", "Сначала загрузите аккаунты"); return
+        if self.worker.isRunning():
+            QMessageBox.information(self, "Занято", "Процесс уже выполняется"); return
+        self.worker.set_task(self.worker.task_login_all)
+        self.worker.start()
+
+    def on_logout_selected(self):
+        rows = sorted({idx.row() for idx in self.tbl.selectedIndexes()})
+        if not rows:
+            QMessageBox.information(self, "Выбор", "Выберите строки для выхода"); return
+        if self.worker.isRunning():
+            QMessageBox.information(self, "Занято", "Процесс уже выполняется"); return
+        self.worker.set_task(self.worker.task_logout_selected, rows)
+        self.worker.start()
+
+    def on_join(self):
+        if not self.club_ids:
+            QMessageBox.critical(self, "Ошибка", "Сначала загрузите клубы"); return
+        if not any(a.token for a in self.accounts):
+            QMessageBox.critical(self, "Ошибка", "Сначала войдите в аккаунты (нет токенов)"); return
+        if self.worker.isRunning():
+            QMessageBox.information(self, "Занято", "Процесс уже выполняется"); return
+        clubs_to_process = self.club_ids.copy()
+        if self.chk_shuffle.isChecked():
+            import random; random.shuffle(clubs_to_process); self.log.appendPlainText(f"{Icons.INFO} Список клубов перемешан для обработки")
+        limit = self.spn_clubs_per_account.value()
+        dmin = self.spn_delay_min.value(); dmax = self.spn_delay_max.value()
+        if dmax < dmin:
+            dmin, dmax = dmax, dmin
+        message_text = self.txt_message.text().strip()
+        self.worker.set_task(self.worker.task_join_round, clubs_to_process, limit, dmin, dmax, message_text)
+        self.worker.start()
+
+    def on_pause(self):
+        if not self.worker.isRunning():
+            QMessageBox.information(self, "Пауза", "Нет активного процесса для паузы"); return
+        self.worker.pause_toggle()
+
+    def on_worker_pause_changed(self, paused: bool):
+        self.btn_pause.setText("▶️ Продолжить" if paused else "⏸ Пауза")
+        self.save_settings()
+
+    def on_worker_started(self):
+        try:
+            self.btn_stop.setEnabled(True)
+            self.btn_pause.setEnabled(True)
+            self.btn_pause.setText("⏸ Пауза")
+            # Отключить операции на время выполнения
+            self.btn_join.setEnabled(False)
+            self.btn_login.setEnabled(False)
+            self.btn_logout.setEnabled(False)
+        except Exception:
+            pass
+
+    def on_worker_finished(self):
+        try:
+            self.btn_stop.setEnabled(False)
+            self.btn_pause.setEnabled(False)
+            self.btn_pause.setText("⏸ Пауза")
+            # Вернуть операции
+            self.btn_join.setEnabled(True)
+            self.btn_login.setEnabled(True)
+            self.btn_logout.setEnabled(True)
+        except Exception:
+            pass
+
+    def on_stop(self):
+        if self.worker.isRunning():
+            self.worker.stop(); self.log.appendPlainText(f"{Icons.WARNING} 🛑 Запрос на остановку отправлен...")
+        else:
+            QMessageBox.information(self, "Остановка", "Нет активных процессов для остановки")
+
+    def on_task_finished(self):
+        self.btn_stop.setEnabled(False)
+        self.btn_pause.setEnabled(False)
+        self.btn_pause.setText("⏸ Пауза")
+
+    def on_task_finished(self):
+        """Сброс внутренних флагов после завершения задачи (как в XPoker)."""
+        try:
+            self.worker._stop = False
+            self.worker._pause = False
+            try:
+                self.worker._cancel_event.clear()
+            except Exception:
+                pass
+            self.worker._last_club_info = {
+                'club_id': None,
+                'username': None,
+                'success': None,
+                'message': None
+            }
+        except Exception:
+            pass
+
+    def on_export_report(self):
+        if not self.report_rows:
+            QMessageBox.information(self, "Нет данных", "Пока нет данных для отчета"); return
+        path, _ = QFileDialog.getSaveFileName(self, "Сохранить отчет", "", "Excel (*.xlsx)")
+        if not path: return
+        try:
+            import pandas as pd
+            report_data = []
+            for jr in self.report_rows:
+                report_data.append(jr.as_dict() if hasattr(jr, 'as_dict') else jr)
+            df = pd.DataFrame(report_data)
+            if len(df.columns) > 0:
+                column_order = [col for col in REPORT_COLUMNS if col in df.columns]
+                if column_order:
+                    df = df[column_order]
+            df.to_excel(path, index=False)
+            self.log.appendPlainText(f"{Icons.SUCCESS} Отчет сохранен: {path}")
+            self.log.appendPlainText(f"{Icons.INFO} Экспортировано записей: {len(report_data)}")
+        except Exception as e:
+            QMessageBox.critical(self, "Ошибка экспорта", str(e))
+
+    def update_clubs_count(self):
+        self.clubs_count_label.setText(f"Клубов: {len(self.club_ids)}")
+
+    def save_settings(self):
+        settings = {
+            'accounts': [{
+                'username': acc.username,
+                'password': acc.password,
+                'device_id': acc.device_id,
+                'proxy': acc.proxy,
+                'refresh_token': acc.refresh_token,
+                'access_token_expire': acc.access_token_expire,
+                'refresh_token_expire': acc.refresh_token_expire,
+            } for acc in self.accounts],
+            'club_ids': self.club_ids,
+            'settings': {
+                'clubs_per_account': self.spn_clubs_per_account.value(),
+                'delay_min_ms': self.spn_delay_min.value(),
+                'delay_max_ms': self.spn_delay_max.value(),
+                'shuffle_clubs': self.chk_shuffle.isChecked(),
+                'apply_message': self.txt_message.text(),
+            }
+        }
+        try:
+            from pathlib import Path
+            p = Path('files')/"pppoker_settings.json"
+            with open(p, 'w', encoding='utf-8') as f:
+                json.dump(settings, f, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
+
+    def load_settings(self):
+        from pathlib import Path
+        p = Path('files')/"pppoker_settings.json"
+        if not p.exists():
+            self.log.appendPlainText(f"{Icons.INFO} Файл настроек PPPoker не найден, используем значения по умолчанию")
+            return
+        try:
+            if p.stat().st_size == 0:
+                raise ValueError("empty settings file")
+            with open(p, 'r', encoding='utf-8') as f:
+                settings = json.load(f)
+            self.accounts.clear(); self.tbl.setRowCount(0)
+            for acc_data in settings.get('accounts', []):
+                raw_dev = acc_data.get('device_id') or ""
+                uname = acc_data.get('username','')
+                acc = Account(
+                    username=uname,
+                    password=acc_data.get('password',''),
+                    device_id=self._ensure_imei(raw_dev, uname),
+                    proxy=acc_data.get('proxy'),
+                )
+                acc.refresh_token = acc_data.get('refresh_token')
+                acc.access_token_expire = acc_data.get('access_token_expire')
+                acc.refresh_token_expire = acc_data.get('refresh_token_expire')
+                self.accounts.append(acc); self._append_account_row(acc)
+            self.club_ids = settings.get('club_ids', [])
+            self.update_clubs_count()
+            ui = settings.get('settings', {})
+            self.spn_clubs_per_account.setValue(ui.get('clubs_per_account', 500))
+            self.spn_delay_min.setValue(ui.get('delay_min_ms', 500))
+            self.spn_delay_max.setValue(ui.get('delay_max_ms', 1500))
+            self.chk_shuffle.setChecked(ui.get('shuffle_clubs', True))
+            self.txt_message.setText(ui.get('apply_message',''))
+            self.worker.accounts = self.accounts
+            self.log.appendPlainText(f"{Icons.SUCCESS} Загружены настройки: {len(self.accounts)} аккаунтов, {len(self.club_ids)} клубов")
+        except Exception:
+            try:
+                p.rename(p.with_suffix('.bak'))
+            except Exception:
+                pass
+            self.accounts.clear(); self.tbl.setRowCount(0); self.club_ids = []; self.update_clubs_count()
+            self.log.appendPlainText(f"{Icons.ERROR} Ошибка загрузки настроек PPPoker. Загружены значения по умолчанию")
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -624,9 +1369,13 @@ class MainWindow(QMainWindow):
         self.club_ids: List[str] = []
         self.report_rows: List[dict] = []
 
-        root = QWidget()
-        self.setCentralWidget(root)
-        v = QVBoxLayout(root)
+        # Вкладки: XPoker (основной) + PPPoker
+        self.tabs = QtWidgets.QTabWidget()
+        self.setCentralWidget(self.tabs)
+
+        xp_root = QWidget()
+        self.tabs.addTab(xp_root, "XPoker")
+        v = QVBoxLayout(xp_root)
 
         # 🔸 СЕКЦИЯ УПРАВЛЕНИЯ АККАУНТАМИ
         accounts_group = QGroupBox("📋 Управление аккаунтами")
@@ -686,13 +1435,11 @@ class MainWindow(QMainWindow):
         operations_layout.addWidget(self.btn_pause)
         operations_layout.addWidget(self.btn_stop)
         operations_layout.addWidget(self.btn_export)
-        # Тема (светлая/тёмная/системная)
-        operations_layout.addWidget(QLabel("Тема:"))
+        # Контрол темы перенесён в статус-бар
         self.cmb_theme = QComboBox()
         self.cmb_theme.addItem("Системная", userData='system')
         self.cmb_theme.addItem("Светлая", userData='light')
         self.cmb_theme.addItem("Тёмная", userData='dark')
-        operations_layout.addWidget(self.cmb_theme)
         operations_layout.addStretch()
         v.addWidget(operations_group)
 
@@ -765,7 +1512,7 @@ class MainWindow(QMainWindow):
         self._upd_thread: Optional[UpdateDownloadThread] = None
         self._upd_dialog: Optional[QDialog] = None
         
-        self.worker = Worker(self.accounts)
+        self.worker = Worker(self.accounts, api_class=XPokerAPI, api_error_class=ApiError)
         self.worker.log.connect(self.on_worker_log)
         self.worker.account_updated.connect(self.on_account_updated)
         self.worker.join_result.connect(self.on_join_result)
@@ -804,10 +1551,28 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
             sb.addPermanentWidget(self.btn_check_update)
+            # Тема в статус-баре (видна на любой вкладке)
+            try:
+                sb.addPermanentWidget(QLabel("Тема:"))
+                sb.addPermanentWidget(self.cmb_theme)
+            except Exception:
+                pass
             ver_lbl = QLabel(f"Версия: {__version__}")
             sb.addPermanentWidget(ver_lbl)
         except Exception:
             pass
+
+        # Добавляем вкладку PPPoker
+        try:
+            from pppoker.api import PPPokerAPI, ApiError as PPPApiError
+            self.pp_tab = PPPokerTab(parent=self)
+            self.tabs.addTab(self.pp_tab, "PPPoker")
+            try:
+                self.pp_tab.update_table_theme()
+            except Exception:
+                pass
+        except Exception as e:
+            logging.getLogger(__name__).exception(f"PPPoker tab init failed: {e}")
 
     def on_load_accounts(self):
         """Загрузить аккаунты из Excel файла."""
@@ -1678,6 +2443,12 @@ class MainWindow(QMainWindow):
             self.save_settings()
         except Exception as e:
             self.log.appendPlainText(f"{Icons.ERROR} Ошибка сохранения при выходе: {e}")
+        # Сохраним настройки PPPoker вкладки тоже
+        try:
+            if hasattr(self, 'pp_tab') and self.pp_tab:
+                self.pp_tab.save_settings()
+        except Exception:
+            pass
         super().closeEvent(event)
 
 
@@ -1725,6 +2496,11 @@ class MainWindow(QMainWindow):
                 pass
         # Применить настройки таблиц (фон/левый служебный столбец)
         self.update_table_theme()
+        try:
+            if hasattr(self, 'pp_tab') and self.pp_tab:
+                self.pp_tab.update_table_theme()
+        except Exception:
+            pass
         # Обновить выбор в комбобоксе (если меняли программно)
         try:
             idx = next(i for i in range(self.cmb_theme.count()) if self.cmb_theme.itemData(i) == self.theme_pref)

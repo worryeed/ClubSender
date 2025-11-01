@@ -42,5 +42,9 @@ Thumbs.db
 # PyUpdater local data (keys/manifests) — keep out of VCS
 pyu-data/
 files/xpoker_settings.json
+files/pppoker_settings.json
 files/xpoker_gui.log
+
+# Temporary PPPoker core pack
+temp/
 
