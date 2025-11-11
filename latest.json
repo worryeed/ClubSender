@@ -1,10 +1,10 @@
 {
-  "version": "1.1.0",
-  "notes": "PPPoker GA: вкладка и ядро (HTTP+TCP); полное соответствие UI XPoker; тема в статус-баре; сохранения; IMEI 40-hex; улучшения отмены/паузы.",
+  "version": "1.1.1",
+  "notes": "Поддержка X‑Poker 1.12.68; фиксы TCP‑последовательности; обновление версий.",
   "assets": {
     "windows": {
-      "url": "https://github.com/worryeed/ClubSender/releases/download/v1.1.0/ClubSender.exe",
-      "sha256": "D85695F7E7750188820FB0518834EAE7450530E07FC71E6937E50E1ED48DBC0C"
+      "url": "https://github.com/worryeed/ClubSender/releases/download/v1.1.1/ClubSender.exe",
+      "sha256": "123C4BC2F7C6AD45DCDB20458F975FB81122E95965DBD6E765C965260AA81902"
     }
   }
 }
