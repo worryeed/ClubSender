@@ -5,6 +5,9 @@ CLUB_SERVER_HOST = "158.160.128.14"
 CLUB_SERVER_PORT = 5000
 DEFAULT_TIMEOUT = 10.0
 
+# X-Poker client app version (as seen by server)
+XPOKER_CLIENT_VERSION = "1.12.68"
+
 # HTTP API endpoints
 DEFAULT_BASE_URL = "https://api.x-poker.net"
 LOGIN_PATH = "/api/auth/login"
@@ -70,7 +73,7 @@ TEMPLATE_VALUES = {
     "uid": 27849547,  # Decoded from varint 0xcb92d901 
     "club_id": 123,  # 0x7b from packets
     "username": "Я XP3557707".encode('utf-8'),  # UTF-8 bytes from ApplyClubREQ
-    "version": b"1.12.67"
+    "version": b"1.12.68"
 }
 
 # Message headers (DEPRECATED - old 6-byte application headers)

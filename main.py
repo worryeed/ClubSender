@@ -40,6 +40,9 @@ from core.messages import Icons, format_login_step, format_join_result, MESSAGES
 from core.version import __version__
 from update.manager import UpdateManager
 
+# Версия приложения для релизов/GUI
+APP_VERSION = __version__
+
 APP_TITLE = "ClubSender"
 ACCOUNTS_COLUMNS = ["Имя пользователя", "Пароль", "Прокси", "ID устройства", "Токен (кратко)", "Последний вход"]
 EXTRA_COLUMNS = ["Прогресс", "Статус", "Текущий клуб"]

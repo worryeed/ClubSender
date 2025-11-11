@@ -23,7 +23,7 @@ from .constants import (
     CLUB_SERVER_HOST, CLUB_SERVER_PORT, DEFAULT_TIMEOUT,
     TEMPLATES, TEMPLATE_VALUES, MSG_HEADERS,
     MSG_USER_LOGIN_RSP, MSG_APPLY_CLUB_RSP, MSG_GET_CLUB_DESC_RSP,
-    DEFAULT_HEARTBEAT_INTERVAL
+    DEFAULT_HEARTBEAT_INTERVAL, XPOKER_CLIENT_VERSION
 )
 
 log = logging.getLogger(__name__)
@@ -111,7 +111,7 @@ class XClubTCPClient:
         # Stored auth context for autoreconnect
         self._uid: Optional[int] = None
         self._token: Optional[str] = None
-        self._version: str = "1.12.67"
+        self._version: str = XPOKER_CLIENT_VERSION
         # Post-login bootstrap state
         self._bootstrap_done = threading.Event()
         self._disable_bootstrap = bool(disable_bootstrap)
@@ -716,7 +716,7 @@ class XClubTCPClient:
         log.debug(f"Send+Wait: {msg_type} (type_id=0x{msg_type_id:04x}, seq={seq}) -> expect {expected_cmd} within {timeout}s")
         return self.wait_for_cmd(expected_cmd, timeout)
         
-    def tcp_login(self, uid: int, token: str, version: str = "1.12.67") -> bytes:
+    def tcp_login(self, uid: int, token: str, version: str = XPOKER_CLIENT_VERSION) -> bytes:
         """Send TCP login request using the correct builder framing.
         
         Args:
@@ -988,7 +988,7 @@ class XClubTCPClient:
         except Exception:
             return b""
     
-    def debug_club_join_sequence(self, uid: int, token: str, club_id: int, version: str = "1.12.67") -> dict:
+    def debug_club_join_sequence(self, uid: int, token: str, club_id: int, version: str = XPOKER_CLIENT_VERSION) -> dict:
         """Debug method to follow the exact TCP sequence from Frida logs.
         
         Based on the captured sequence:

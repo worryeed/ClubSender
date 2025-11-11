@@ -18,7 +18,7 @@ from .proxy_utils import normalize_proxy_input
 from .constants import (
     DEFAULT_BASE_URL, LOGIN_PATH, LOGOUT_PATH,
     JOIN_CLUB_PATH, SEARCH_CLUB_PATH, REFRESH_PATH,
-    DEFAULT_HEARTBEAT_INTERVAL,
+    DEFAULT_HEARTBEAT_INTERVAL, XPOKER_CLIENT_VERSION,
 )
 from .client import XClubTCPClient
 from .messages import Icons, decode_club_apply_status, format_tcp_step
@@ -42,7 +42,7 @@ def default_headers() -> Dict[str, str]:
     return {
         "Accept": "application/json",
         "Content-Type": "application/json; charset=utf-8", 
-        "User-Agent": "X-Poker/1.12.67 (Windows)",
+        "User-Agent": "X-Poker/1.12.68 (Windows)",
         "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
         "Accept-Encoding": "gzip, deflate, br",
         "Origin": "https://xpoker.games",
@@ -636,7 +636,7 @@ class XPokerAPI:
             log.info(format_tcp_step("TCP соединение установлено", True))
             log.info(f"{Icons.AUTH} TCP авторизация...")
             start_time = time.time()
-            login_response = tcp_client.tcp_login(uid, token, version="1.12.67")
+            login_response = tcp_client.tcp_login(uid, token, version=XPOKER_CLIENT_VERSION)
             login_time = time.time() - start_time
             if b"pk.UserLoginRSP" in login_response:
                 log.info(format_tcp_step(f"TCP авторизация успешна ({login_time:.3f}с)", True, f"размер ответа: {len(login_response)} байт"))
