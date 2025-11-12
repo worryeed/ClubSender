@@ -1110,6 +1110,7 @@ class XClubTCPClient:
                     if decoded_apply:
                         status = decoded_apply.get('status', -1)
                         results["apply_status"] = status
+                        reason_text = (decoded_apply.get('reason_text') or '').strip()
                         
                         from core.messages import decode_club_apply_status
                         status_info = decode_club_apply_status(status)
@@ -1122,7 +1123,9 @@ class XClubTCPClient:
                             results["success"] = True
                             results["final_message"] = "Already member of club"
                         else:
-                            results["final_message"] = f"Join failed: {status_info['message']}"
+                            # В приоритете текстовая причина из ответа, если есть
+                            fail_reason = reason_text or status_info['message']
+                            results["final_message"] = f"Join failed: {fail_reason}"
                     else:
                         add_step("Parse Apply Result", False, "Failed to decode response")
                         results["final_message"] = "Failed to parse apply response"
@@ -1539,6 +1542,7 @@ class XClubTCPClient:
                     decoded = ProtobufDecoder.decode_apply_club_response(apply_response)
                     if decoded:
                         status = decoded.get('status', -1)
+                        reason_text = (decoded.get('reason_text') or '').strip()
                         from core.messages import decode_club_apply_status
                         status_info = decode_club_apply_status(status)
                         
@@ -1547,7 +1551,8 @@ class XClubTCPClient:
                         elif status == 2:
                             return True, "Already member of club"
                         else:
-                            return False, f"Join failed: {status_info['message']}"
+                            fail_reason = reason_text or status_info['message']
+                            return False, f"Join failed: {fail_reason}"
                     else:
                         return True, "Got ApplyClubRSP but couldn't parse status"
                 except Exception as e:

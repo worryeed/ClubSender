@@ -85,29 +85,32 @@ def get_club_status_message(status_code: int, club_exists: bool = True, club_id:
 
 def format_join_result(username: str, club_id: str, success: bool, message: str) -> str:
     """
-    Форматировать результат проверки клуба с индикаторами.
+    Форматировать результат проверки/попытки вступления в клуб.
     
-    Мы не утверждаем немедленное вступление — показываем упрощённый статус наличия клуба.
-    
-    Args:
-        username: Имя пользователя
-        club_id: ID клуба
-        success: Успешность операции (True = клуб существует/доступен)
-        message: Оригинальное сообщение (используется только для отмены/ошибок сети)
-        
-    Returns:
-        Отформатированное сообщение
+    Логика:
+    - success=True  -> "Клуб есть" (вступление успешно/уже в клубе)
+    - success=False -> различаем «клуба нет» и «клуб есть, но заявка не отправлена» по тексту сообщения
     """
     m = (message or "").strip()
+    low = m.lower()
     # Отдельный случай: отмена
-    if not success and ("Cancel" in m or "Отмен" in m):
-        icon = Icons.WARNING
-        text = "Отменено"
-        return f"{icon} [{username}] → Клуб {club_id}: {text}"
-    # Основная логика отображения
-    icon = Icons.SUCCESS if success else Icons.ERROR
-    text = "Клуб есть" if success else "Клуба нет"
-    return f"{icon} [{username}] → Клуб {club_id}: {text}"
+    if not success and ("cancel" in low or "отмен" in low):
+        return f"{Icons.WARNING} [{username}] → Клуб {club_id}: Отменено"
+    if success:
+        return f"{Icons.SUCCESS} [{username}] → Клуб {club_id}: Клуб есть"
+    # Определяем сценарий «клуба нет» по характерным словам
+    not_found_markers = (
+        "не существует",
+        "клуб не найден",
+        "club not found",
+    )
+    if any(p in low for p in not_found_markers):
+        return f"{Icons.ERROR} [{username}] → Клуб {club_id}: Клуба нет"
+    # Иначе — клуб есть, но заявка не отправлена; выводим причину, если она есть
+    reason = m
+    if reason.lower().startswith("join failed:"):
+        reason = reason.split(":", 1)[1].strip() or reason
+    return f"{Icons.ERROR} [{username}] → Клуб {club_id}: Клуб есть, но заявка не отправлена: {reason}"
 
 def format_tcp_step(step_name: str, success: bool, details: str = "") -> str:
     """

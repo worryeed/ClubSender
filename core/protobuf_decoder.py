@@ -182,6 +182,7 @@ def decode_apply_club_response(response: bytes) -> Dict[str, Any]:
         "status": -1,
         "status_meaning": "Unknown",
         "message": "",
+        "reason_text": "",  # извлеченная текстовая причина, если есть
         "raw_fields": {},
         "raw_hex": "",
     }
@@ -235,6 +236,21 @@ def decode_apply_club_response(response: bytes) -> Dict[str, Any]:
     # Формат 2: Стандартный protobuf
     fields = parse_protobuf_fields(payload)
     result["raw_fields"] = fields
+
+    # Попробуем извлечь человекочитаемую причину (строки из payload)
+    reason_text: str = ""
+    try:
+        for _fno, values in (fields or {}).items():
+            for v in values or []:
+                if isinstance(v, str):
+                    # Отсекаем явные URL/пустые строки, берем самую длинную осмысленную
+                    if (v.strip() and not v.strip().lower().startswith("http")):
+                        if len(v) > len(reason_text):
+                            reason_text = v.strip()
+    except Exception:
+        pass
+    if reason_text:
+        result["reason_text"] = reason_text
     
     # Проверка на ошибку "клуб не найден" - приоритетная
     # В ответе об ошибке field 2 содержит 1002, field 25 содержит дополнительный код
@@ -245,13 +261,14 @@ def decode_apply_club_response(response: bytes) -> Dict[str, Any]:
         # club_id может быть в field 25
         if 25 in fields and fields[25]:
             club_id_hint = fields[25][0]
-            if club_id_hint == 3:
-                result["club_id"] = 456  # Подсказка что это был клуб 456
+            if isinstance(club_id_hint, int):
+                result["club_id"] = club_id_hint
         return result
     
     # Field 15 может содержать club_id  
     if 15 in fields and fields[15]:
-        result["club_id"] = fields[15][0]
+        if isinstance(fields[15][0], int):
+            result["club_id"] = fields[15][0]
     
     # Field 2 содержит status
     if 2 in fields and fields[2]:
@@ -269,7 +286,11 @@ def decode_apply_club_response(response: bytes) -> Dict[str, Any]:
             result["message"] = "Уже состоите в клубе"
         else:
             result["status_meaning"] = f"Error (status={status})"
-            result["message"] = f"Ошибка: статус {status}"
+            result["message"] = (reason_text or f"Ошибка: статус {status}")
+
+    # Если статус не распознан, но есть причина — используем её
+    if (not result.get("message")) and reason_text:
+        result["message"] = reason_text
 
     return result
 

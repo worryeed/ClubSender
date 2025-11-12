@@ -45,16 +45,27 @@ class JoinResult:
 
     def as_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for reporting - ключи должны соответствовать REPORT_COLUMNS.
-        Здесь нормализуем текст сообщения под требования GUI/отчёта:
+        Сообщение детализируем:
         - ok=True  -> "Клуб есть"
-        - ok=False -> "Клуба нет"
-        - отмена   -> "Отменено"
+        - ok=False & отмена -> "Отменено"
+        - ok=False & not found -> "Клуба нет"
+        - ok=False & прочее -> "Клуб есть, но заявка не отправлена: <причина>"
         """
         raw = (self.message or "").strip()
-        if (not self.ok) and ("Cancel" in raw or "Отмен" in raw):
+        low = raw.lower()
+        if (not self.ok) and ("cancel" in low or "отмен" in low):
             msg = "Отменено"
+        elif self.ok:
+            msg = "Клуб есть"
         else:
-            msg = "Клуб есть" if self.ok else "Клуба нет"
+            not_found_markers = ("не существует", "клуб не найден", "club not found")
+            if any(p in low for p in not_found_markers):
+                msg = "Клуба нет"
+            else:
+                reason = raw
+                if reason.lower().startswith("join failed:"):
+                    reason = reason.split(":", 1)[1].strip() or reason
+                msg = f"Клуб есть, но заявка не отправлена: {reason}"
         return {
             "Время": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(self.ts)),
             "Имя пользователя": self.username,
