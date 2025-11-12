@@ -137,31 +137,33 @@ def parse_protobuf_fields(data: bytes, *, skip_leading_zeros: bool = False) -> D
 
 def find_payload_start(response: bytes) -> int:
     """
-    Найти начало payload в TCP-ответе.
-    Реальный формат: после "pk.*RSP" идет '$' (0x24), затем 0x00 0x08, после чего payload.
+    Найти начало protobuf-payload в TCP-ответе X‑Poker.
+    Правильный формат (по реальным дампам):
+      [.. "pk.*RSP" ..] 24 00 <protobuf>
+    Ранее предполагалось 24 00 08, но это не всегда верно (напр. ApplyClubRSP начинается с тега 0x10).
     Возвращает индекс начала payload или -1.
     """
-    # Найдем позицию "pk."
+    # Найти "pk." и ближайший "RSP"
     pk_index = response.find(b"pk.")
     if pk_index == -1:
         return -1
-    
-    # Найти 'RSP' после 'pk.'
     rsp_index = response.find(b"RSP", pk_index)
     if rsp_index == -1:
         return -1
-    
-    # После RSP должен быть символ '$' (0x24)
-    dollar_index = rsp_index + 3  # RSP = 3 байта
-    if dollar_index >= len(response) or response[dollar_index] != 0x24:
+    # После 'RSP' ожидаем '$' (0x24) и NUL (0x00)
+    i = rsp_index + 3
+    if i + 1 >= len(response):
         return -1
-    
-    # После '$' идут байты 0x00 0x08, затем payload
-    payload_start = dollar_index + 3  # '$' + 0x00 + 0x08
-    if payload_start > len(response):
+    if response[i] != 0x24:
         return -1
-    
-    return payload_start
+    if response[i+1] != 0x00:
+        # Нестандартный случай — попробуем найти ближайшую последовательность 24 00 после RSP
+        alt = response.find(b"\x24\x00", i)
+        if alt == -1:
+            return -1
+        return alt + 2
+    # Обычный случай: payload сразу после 24 00
+    return i + 2
 
 
 # -------------------------------

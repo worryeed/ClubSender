@@ -1455,29 +1455,25 @@ class XClubTCPClient:
                 pass
             
             def _desc_indicates_existence(resp: bytes) -> bool:
-                # Если вообще пришёл GetClubDescRSP — считаем, что клуб вероятно существует
+                """Строгая проверка существования клуба по описанию.
+                Считаем, что клуб существует, только если декодировано имя клуба (club_name)
+                или явный флаг exists=True. Наличие RSP само по себе недостаточно.
+                """
                 has_rsp = bool(resp) and (MSG_GET_CLUB_DESC_RSP.encode() in resp)
                 if not has_rsp:
                     return False
-                # Пытаемся распарсить: если пусто — считаем как отсутствие
                 try:
                     from core.protobuf_decoder import ProtobufDecoder
                     decoded = ProtobufDecoder.decode_club_desc_response(resp)
                     if not decoded or not isinstance(decoded, dict):
-                        return True  # есть RSP, но декодер не уверен — допускаем существование
+                        return False
                     club_info = decoded.get("club_info", {}) or {}
-                    top_fields = decoded.get("top_fields", {}) or {}
-                    # Явное существование: есть имя или exists=True
                     if club_info.get("club_name") or club_info.get("exists"):
                         return True
-                    # Явное отсутствие: парсер не нашёл никаких полей
-                    if not top_fields:
-                        return False
-                    # По умолчанию: раз есть RSP и какие-то поля — допустим, что существует
-                    return True
-                except Exception as _:
-                    # На любой сбой парсинга доверяем факту наличия RSP
-                    return True
+                    return False
+                except Exception:
+                    # Консервативно: при ошибке парсинга считаем клуб несуществующим
+                    return False
             
             club_exists = _desc_indicates_existence(desc_response)
             if not club_exists:

@@ -85,32 +85,30 @@ def get_club_status_message(status_code: int, club_exists: bool = True, club_id:
 
 def format_join_result(username: str, club_id: str, success: bool, message: str) -> str:
     """
-    Форматировать результат проверки/попытки вступления в клуб.
-    
-    Логика:
-    - success=True  -> "Клуб есть" (вступление успешно/уже в клубе)
-    - success=False -> различаем «клуба нет» и «клуб есть, но заявка не отправлена» по тексту сообщения
+    Форматировать результат: различать "клуба нет" и "клуб есть, но заявка не отправлена".
+    Дополнительно: для дневного лимита (1005 / "слишком много запросов") использовать жёлтый индикатор.
     """
     m = (message or "").strip()
     low = m.lower()
-    # Отдельный случай: отмена
+    # Отмена
     if not success and ("cancel" in low or "отмен" in low):
         return f"{Icons.WARNING} [{username}] → Клуб {club_id}: Отменено"
     if success:
         return f"{Icons.SUCCESS} [{username}] → Клуб {club_id}: Клуб есть"
-    # Определяем сценарий «клуба нет» по характерным словам
-    not_found_markers = (
-        "не существует",
-        "клуб не найден",
-        "club not found",
-    )
+    # Явные маркеры отсутствия клуба
+    not_found_markers = ("не существует", "клуб не найден", "club not found")
     if any(p in low for p in not_found_markers):
         return f"{Icons.ERROR} [{username}] → Клуб {club_id}: Клуба нет"
-    # Иначе — клуб есть, но заявка не отправлена; выводим причину, если она есть
+    # Иначе — заявка не отправлена (причину показываем, если есть)
     reason = m
     if reason.lower().startswith("join failed:"):
         reason = reason.split(":", 1)[1].strip() or reason
-    return f"{Icons.ERROR} [{username}] → Клуб {club_id}: Клуб есть, но заявка не отправлена: {reason}"
+    if not reason:
+        reason = "причина не указана (возможно дневной лимит)"
+    # Жёлтый индикатор для дневного лимита
+    daily_markers = ("слишком много", "1005", "too many")
+    icon = Icons.WARNING if any(p in low for p in daily_markers) or any(p in reason.lower() for p in daily_markers) else Icons.ERROR
+    return f"{icon} [{username}] → Клуб {club_id}: Клуб есть, но заявка не отправлена: {reason}"
 
 def format_tcp_step(step_name: str, success: bool, details: str = "") -> str:
     """
@@ -209,6 +207,12 @@ def decode_club_apply_status(status_code: int) -> Dict[str, Any]:
             "icon": Icons.ERROR,
             "message": "❌ Клуба не существует", 
             "description": "Клуб не найден или недоступен (статус 1002)"
+        },
+        1005: {
+            "success": False,
+            "icon": Icons.WARNING,
+            "message": "Слишком много запросов сегодня",
+            "description": "Дневной лимит заявок исчерпан — попробуйте завтра (статус 1005)"
         }
     }
     

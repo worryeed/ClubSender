@@ -45,10 +45,10 @@ class JoinResult:
 
     def as_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for reporting - ключи должны соответствовать REPORT_COLUMNS.
-        Сообщение детализируем:
+        Логика:
         - ok=True  -> "Клуб есть"
         - ok=False & отмена -> "Отменено"
-        - ok=False & not found -> "Клуба нет"
+        - ok=False & явные маркеры not found -> "Клуба нет"
         - ok=False & прочее -> "Клуб есть, но заявка не отправлена: <причина>"
         """
         raw = (self.message or "").strip()
@@ -65,6 +65,8 @@ class JoinResult:
                 reason = raw
                 if reason.lower().startswith("join failed:"):
                     reason = reason.split(":", 1)[1].strip() or reason
+                if not reason:
+                    reason = "причина не указана (возможно дневной лимит)"
                 msg = f"Клуб есть, но заявка не отправлена: {reason}"
         return {
             "Время": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(self.ts)),
