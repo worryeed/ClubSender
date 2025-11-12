@@ -1,10 +1,10 @@
 {
-  "version": "1.1.1",
-  "notes": "Поддержка X‑Poker 1.12.68; фиксы TCP‑последовательности; обновление версий.",
+  "version": "1.1.2",
+  "notes": "XPoker: фикс смещения payload (RSP $00); статус 1005 (дневной лимит) и жёлтый индикатор; строгая проверка существования клуба.",
   "assets": {
     "windows": {
-      "url": "https://github.com/worryeed/ClubSender/releases/download/v1.1.1/ClubSender.exe",
-      "sha256": "123C4BC2F7C6AD45DCDB20458F975FB81122E95965DBD6E765C965260AA81902"
+      "url": "https://github.com/worryeed/ClubSender/releases/download/v1.1.2/ClubSender.exe",
+      "sha256": "561F268E68A2CB3C198640785FFBDD45BECF47F52AB8748D6D0211130A0396D9"
     }
   }
 }
