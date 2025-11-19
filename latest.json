@@ -1,10 +1,10 @@
 {
-  "version": "1.1.2",
-  "notes": "XPoker: фикс смещения payload (RSP $00); статус 1005 (дневной лимит) и жёлтый индикатор; строгая проверка существования клуба.",
+  "version": "1.1.3",
+  "notes": "XPoker: IP Limit автопометка/скип и динамическое перераспределение; пауза 5xx=20с; меньше коллизий имён; отключён TLS key logging; параллельная авторизация по группам прокси; улучшенные логи.",
   "assets": {
     "windows": {
-      "url": "https://github.com/worryeed/ClubSender/releases/download/v1.1.2/ClubSender.exe",
-      "sha256": "561F268E68A2CB3C198640785FFBDD45BECF47F52AB8748D6D0211130A0396D9"
+      "url": "https://github.com/worryeed/ClubSender/releases/download/v1.1.3/ClubSender.exe",
+      "sha256": "38C2DF182E250FBF49379664ABA5E56E83D15BFFC8C2EBF9AB1F6AEE9F04F7CF"
     }
   }
 }
