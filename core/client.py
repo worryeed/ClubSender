@@ -518,7 +518,12 @@ class XClubTCPClient:
                 continue
             except Exception as e:
                 if not self._pump_stop.is_set():
-                    log.exception(f"Pump read error: {e}")
+                    # Для ожидаемого закрытия соединения сервером (EOF) — не засоряем лог трассировкой
+                    emsg = str(e)
+                    if isinstance(e, OSError) and ("EOF while reading" in emsg or "An existing connection was forcibly closed" in emsg or "timed out" in emsg):
+                        log.info(f"Pump: connection closed by peer ({emsg})")
+                    else:
+                        log.exception(f"Pump read error: {e}")
                     # Помечаем соединение как разорванное и закрываем сокет, не пытаясь останавливать помпу изнутри
                     try:
                         self._connected = False
@@ -868,6 +873,79 @@ class XClubTCPClient:
         except Exception as e:
             log.debug(f"Override(0x000f) GetClubDesc failed: {e}")
         return b""
+
+    def change_name(self, new_name: str, *, flag: int = 1, timeout: float = 4.0) -> tuple[bool, str]:
+        """Изменить ник пользователя через TCP (pk.ChangeNameREQ / RSP).
+
+        Требуется активная TCP-сессия после tcp_login().
+        Возвращает (ok, message).
+        """
+        if not self._logged_in:
+            return False, "Not logged in"
+        try:
+            from .constants import MSG_TYPE_IDS as _IDS
+            from .protocol import varint_encode as _venc
+            name_b = new_name.encode('utf-8')
+            payload = bytes([0x0a]) + _venc(len(name_b)) + name_b + bytes([0x10, flag & 0xff])
+            rsp = self.send_cmd_and_wait("pk.ChangeNameREQ", _IDS["ChangeNameREQ"], payload, "pk.ChangeNameRSP", timeout=timeout)
+            if not rsp:
+                return False, "No response"
+            # Parse top-level payload fields and infer status
+            try:
+                from .protobuf_decoder import find_payload_start, parse_protobuf_fields
+                start = find_payload_start(rsp)
+                if start >= 0:
+                    pb = rsp[start:]
+                    fields = parse_protobuf_fields(pb)
+                    # success if field 3 (0x18) == 0
+                    status = None
+                    if 3 in fields and fields[3]:
+                        status = fields[3][0]
+                    ok = (status == 0)
+                    return ok, ("ok" if ok else f"status={status}")
+            except Exception:
+                pass
+            # Fallback: check raw marker 0x18 0x00
+            ok = (b"\x18\x00" in rsp)
+            return ok, ("ok" if ok else "unknown")
+        except Exception as e:
+            return False, f"Error: {e}"
+
+    def change_avatar(self, avatar_url: str, *, timeout: float = 4.0) -> tuple[bool, str]:
+        """Сменить аватар пользователя через TCP (pk.ChangeAvatarREQ / RSP).
+
+        Требуется активная TCP-сессия после tcp_login().
+        Возвращает (ok, message).
+        """
+        if not self._logged_in:
+            return False, "Not logged in"
+        try:
+            from .constants import MSG_TYPE_IDS as _IDS
+            from .protocol import varint_encode as _venc
+            url_b = avatar_url.encode('utf-8')
+            payload = bytes([0x0a]) + _venc(len(url_b)) + url_b
+            rsp = self.send_cmd_and_wait("pk.ChangeAvatarREQ", _IDS["ChangeAvatarREQ"], payload, "pk.ChangeAvatarRSP", timeout=timeout)
+            if not rsp:
+                return False, "No response"
+            # Разбираем payload и проверяем статус (field 2 == 0)
+            try:
+                from .protobuf_decoder import find_payload_start, parse_protobuf_fields
+                start = find_payload_start(rsp)
+                if start >= 0:
+                    pb = rsp[start:]
+                    fields = parse_protobuf_fields(pb)
+                    status = None
+                    if 2 in fields and fields[2]:
+                        status = fields[2][0]
+                    ok = (status == 0)
+                    return ok, ("ok" if ok else f"status={status}")
+            except Exception:
+                pass
+            # Fallback: ищем сырое 0x10 0x00 (field2=0)
+            ok = (b"\x10\x00" in rsp)
+            return ok, ("ok" if ok else "unknown")
+        except Exception as e:
+            return False, f"Error: {e}"
 
     def get_club_desc_via_template(self, club_id: int, msg_type_id_override: Optional[int] = None) -> bytes:
         """Отправить GetClubDescREQ строго по шаблонному payload из дампов, с патчем club_id и корректным seq.

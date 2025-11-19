@@ -35,7 +35,7 @@ except Exception:
         _qdt_mod = None
         _qdt_api = None
 
-from core import Account, JoinResult, XPokerAPI, ApiError
+from core import Account, JoinResult, XPokerAPI, ApiError, XClubTCPClient
 from core.messages import Icons, format_login_step, format_join_result, MESSAGES
 from core.version import __version__
 from update.manager import UpdateManager
@@ -73,6 +73,9 @@ class Worker(QThread):
         # Инъекция провайдера API
         self.api_class = api_class
         self.api_error_class = api_error_class
+        # Отслеживание активных HTTP/TCP клиентов для жёсткой остановки
+        self._live_apis: Set[object] = set()
+        self._live_tcps: Set[object] = set()
 
     log = pyqtSignal(str)
     account_updated = pyqtSignal(int, list)
@@ -81,6 +84,8 @@ class Worker(QThread):
     pause_changed = pyqtSignal(bool)  # Сигнал об изменении состояния паузы
     # username, done, total, status_text, current_club
     account_progress = pyqtSignal(str, int, int, str, str)
+    # Новый аккаунт (после регистрации)
+    new_account = pyqtSignal(object)
 
 
     def stop(self):
@@ -88,6 +93,49 @@ class Worker(QThread):
         try:
             # Сигнализируем всем долгим операциям о необходимости завершения
             self._cancel_event.set()
+        except Exception:
+            pass
+        # Мгновенно обрубаем активные соединения
+        try:
+            self.log.emit(f"{Icons.WARNING} Остановка: прерываем текущие операции немедленно")
+        except Exception:
+            pass
+        # TCP: закрыть сокеты
+        try:
+            for tcp in list(self._live_tcps):
+                try:
+                    if hasattr(tcp, 'set_cancel_event'):
+                        try:
+                            tcp.set_cancel_event(self._cancel_event)
+                        except Exception:
+                            pass
+                    tcp.close()
+                except Exception:
+                    pass
+                finally:
+                    try:
+                        self._live_tcps.discard(tcp)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        # HTTP: закрыть сессии
+        try:
+            for api in list(self._live_apis):
+                try:
+                    sess = getattr(api, 'session', None)
+                    if sess is not None:
+                        try:
+                            sess.close()
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                finally:
+                    try:
+                        self._live_apis.discard(api)
+                    except Exception:
+                        pass
         except Exception:
             pass
 
@@ -124,55 +172,95 @@ class Worker(QThread):
         self._args = args
 
     def task_login_all(self):
+        # Сброс стопа/отмены
+        try:
+            self._stop = False
+            if hasattr(self, "_cancel_event"):
+                self._cancel_event.clear()
+        except Exception:
+            pass
+        # Группируем аккаунты по прокси (ключ = строка прокси или None)
+        from collections import defaultdict
+        groups: Dict[Optional[str], list[int]] = defaultdict(list)
         for idx, acc in enumerate(self.accounts):
-            if self._stop: break
-            try:
-                proxy_info = acc.proxy or 'без прокси'
-                self.log.emit(f"{Icons.AUTH} [{acc.username}] Авторизация через {proxy_info}")
-                api = self.api_class(proxy=acc.proxy)
-                
-                # Генерируем device_id если отсутствует
-                if not acc.device_id:
-                    import uuid
-                    acc.device_id = str(uuid.uuid4())
-                    self.log.emit(f"{Icons.INFO} [{acc.username}] Сгенерирован device_id: {acc.device_id[:8]}...")
-                        
-                data = api.login(
-                    username=acc.username,
-                    password=acc.password,
-                    device_id=acc.device_id
-                )
-                token = api.token
-                acc.token = token
-                # Сохраняем refresh token если есть
-                acc.refresh_token = api.refresh_token
-                acc.access_token_expire = api.access_token_expire
-                acc.refresh_token_expire = api.refresh_token_expire
-                
-                # Try to extract UID from login response
-                uid = api.get_uid_from_login_response(data)
-                if uid:
-                    acc.uid = uid
-                    self.log.emit(format_login_step(acc.username, "UID получен", True, f"uid={uid}"))
-                else:
-                    # If we can't get UID, try to parse from username if it's in XP format
-                    if acc.username.startswith("XP"):
-                        try:
-                            acc.uid = int(acc.username[2:])
-                            self.log.emit(format_login_step(acc.username, "UID получен из имени", True, f"uid={acc.uid}"))
-                        except:
-                            self.log.emit(format_login_step(acc.username, "UID не найден", False, "не удалось извлечь из имени пользователя"))
-                
-                acc.last_login_at = time.time()
-                acc.headers = api.session.headers.copy()
-                self.account_updated.emit(idx, acc.as_row())
-                token_status = 'получен' if token else 'отсутствует'
-                self.log.emit(format_login_step(acc.username, "Авторизация завершена", bool(token), f"токен {token_status}"))
-            except self.api_error_class as e:
-                self.log.emit(format_login_step(acc.username, "Ошибка API", False, str(e)))
-            except Exception as e:
-                self.log.emit(format_login_step(acc.username, "Ошибка авторизации", False, str(e)))
-            time.sleep(self._rand_delay())
+            groups[acc.proxy].append(idx)
+        # Запускаем по одному потоку на каждую группу
+        import threading
+        threads: list[threading.Thread] = []
+        def group_worker(proxy_key: Optional[str], indices: list[int]):
+            for idx in indices:
+                if self._stop:
+                    break
+                acc = self.accounts[idx]
+                try:
+                    proxy_info = acc.proxy or 'без прокси'
+                    self.log.emit(f"{Icons.AUTH} [{acc.username}] Авторизация через {proxy_info}")
+                    api = self.api_class(proxy=acc.proxy)
+                    try:
+                        self._live_apis.add(api)
+                    except Exception:
+                        pass
+                    # Генерируем device_id если отсутствует
+                    if not acc.device_id:
+                        import uuid
+                        acc.device_id = str(uuid.uuid4())
+                        self.log.emit(f"{Icons.INFO} [{acc.username}] Сгенерирован device_id: {acc.device_id[:8]}...")
+                    data = api.login(
+                        username=acc.username,
+                        password=acc.password,
+                        device_id=acc.device_id
+                    )
+                    token = api.token
+                    acc.token = token
+                    # Сохраняем refresh token если есть
+                    acc.refresh_token = api.refresh_token
+                    acc.access_token_expire = api.access_token_expire
+                    acc.refresh_token_expire = api.refresh_token_expire
+                    # Try to extract UID from login response
+                    uid = api.get_uid_from_login_response(data)
+                    if uid:
+                        acc.uid = uid
+                        self.log.emit(format_login_step(acc.username, "UID получен", True, f"uid={uid}"))
+                    else:
+                        if acc.username.startswith("XP"):
+                            try:
+                                acc.uid = int(acc.username[2:])
+                                self.log.emit(format_login_step(acc.username, "UID получен из имени", True, f"uid={acc.uid}"))
+                            except Exception:
+                                self.log.emit(format_login_step(acc.username, "UID не найден", False, "не удалось извлечь из имени пользователя"))
+                    acc.last_login_at = time.time()
+                    try:
+                        acc.headers = api.session.headers.copy()
+                    except Exception:
+                        acc.headers = {}
+                    self.account_updated.emit(idx, acc.as_row())
+                    token_status = 'получен' if token else 'отсутствует'
+                    self.log.emit(format_login_step(acc.username, "Авторизация завершена", bool(token), f"токен {token_status}"))
+                except self.api_error_class as e:
+                    self.log.emit(format_login_step(acc.username, "Ошибка API", False, str(e)))
+                except Exception as e:
+                    self.log.emit(format_login_step(acc.username, "Ошибка авторизации", False, str(e)))
+                finally:
+                    # Закрываем HTTP-сессию, чтобы не держать лишние дескрипторы/сокеты
+                    try:
+                        sess = getattr(api, 'session', None)
+                        if sess is not None:
+                            sess.close()
+                    except Exception:
+                        pass
+                if not self._stop:
+                    time.sleep(self._rand_delay())
+        for proxy_key, idxs in groups.items():
+            t = threading.Thread(target=group_worker, args=(proxy_key, idxs), daemon=True)
+            threads.append(t)
+            t.start()
+        # Ожидаем завершение всех групп или стоп
+        while any(t.is_alive() for t in threads):
+            if self._stop:
+                break
+            self._wait_if_paused()
+            time.sleep(0.2)
+        self.task_finished.emit()
 
     def task_logout_selected(self, rows: List[int]):
         for r in rows:
@@ -192,6 +280,13 @@ class Worker(QThread):
             time.sleep(self._rand_delay())
 
     def task_join_round(self, club_ids: List[str], clubs_per_account: int, delay_min_ms: int, delay_max_ms: int, message_text: Optional[str] = None):
+        # Сброс сигнала остановки и очистка события отмены перед стартом задачи
+        try:
+            self._stop = False
+            if hasattr(self, "_cancel_event"):
+                self._cancel_event.clear()
+        except Exception:
+            pass
         self.jitter_ms = (delay_min_ms, delay_max_ms)
         processed_clubs = 0
         
@@ -239,6 +334,7 @@ class Worker(QThread):
         # Распределяем клубы по аккаунтам порционно
         club_index = 0
         account_jobs = []  # [(acc, [club_ids])]
+        assigned_accounts = 0
         for acc_idx, acc in enumerate(authorized_accounts):
             # Определяем количество клубов для текущего аккаунта
             if using_individual_limits:
@@ -252,7 +348,9 @@ class Worker(QThread):
             start_idx = club_index
             end_idx = min(club_index + account_clubs_count, len(club_ids))
             if start_idx >= len(club_ids):
-                self.log.emit(f"{Icons.INFO} [{acc.username}] Клубы закончились, аккаунт пропускается")
+                remaining = len(authorized_accounts) - acc_idx
+                if remaining > 0:
+                    self.log.emit(f"{Icons.INFO} Осталось аккаунтов без клубов: {remaining} — будут пропущены")
                 break
             account_clubs = club_ids[start_idx:end_idx]
             club_index = end_idx
@@ -260,12 +358,16 @@ class Worker(QThread):
             if len(account_clubs) > 0:
                 clubs_range = f"{account_clubs[0]}-{account_clubs[-1]}" if len(account_clubs) > 1 else account_clubs[0]
                 self.log.emit(f"{Icons.INFO} 👤 [{acc.username}] назначено {len(account_clubs)} клубов: {clubs_range}")
+                assigned_accounts += 1
             account_jobs.append((acc, account_clubs))
         
         # Параллельная обработка по аккаунтам: одно TCP-соединение на аккаунт
         import threading
         processed_clubs_lock = threading.Lock()
         processed_clubs_total = 0
+        # Агрегатор результатов по аккаунтам
+        agg_lock = threading.Lock()
+        agg_results: Dict[str, Dict[str, object]] = {}
         threads: list[threading.Thread] = []
         
         def account_worker(acc: Account, account_clubs: list[str]):
@@ -301,6 +403,20 @@ class Worker(QThread):
                     nonlocal processed_clubs_total
                     with processed_clubs_lock:
                         processed_clubs_total += 1
+                    # Сохраним для мини-отчёта
+                    try:
+                        with agg_lock:
+                            r = agg_results.setdefault(acc.username, {"ok": 0, "fail": 0, "ok_ids": []})
+                            if ok:
+                                r["ok"] = int(r.get("ok", 0)) + 1
+                                try:
+                                    r["ok_ids"].append(str(cid))  # type: ignore
+                                except Exception:
+                                    pass
+                            else:
+                                r["fail"] = int(r.get("fail", 0)) + 1
+                    except Exception:
+                        pass
                     # Избегаем лишнего ожидания после запроса остановки
                     if not self._stop:
                         time.sleep(self._rand_delay())
@@ -334,17 +450,32 @@ class Worker(QThread):
             threads.append(t)
             t.start()
         
-        # Ожидаем завершения всех аккаунтов, при этом уважаем стоп/паузу
-        # Ожидаем завершения всех аккаунтов, уважая паузу; при остановке ждём корректного завершения текущих попыток
+        # Ожидаем завершения всех аккаунтов; при остановке не зависаем в ожидании — выходим сразу, TCP закроется по cancel_event
         while any(t.is_alive() for t in threads):
+            if self._stop:
+                break
             self._wait_if_paused()
-            # При остановке не засоряем лог дополнительными сообщениями — просто ждём корректного завершения
             time.sleep(0.2)
         
-        # Завершение задачи
-        if not self._stop:
-            self.log.emit(f"{Icons.SUCCESS} 🎯 Процесс вступления завершён. Всего обработано клубов: {processed_clubs_total}")
-        # При остановке дополнительно ничего не пишем — единственное сообщение уже было при нажатии кнопки
+        # Итоговый отчёт по вступлению
+        planned_clubs = min(total_clubs_needed, len(club_ids))
+        if self._stop:
+            finish_reason = "Остановлено пользователем"
+            icon = Icons.WARNING
+        elif planned_clubs <= 0:
+            finish_reason = "Нет клубов для обработки"
+            icon = Icons.INFO
+        else:
+            finish_reason = "Все задачи выполнены"
+            icon = Icons.SUCCESS
+        # Если клубов не хватило на всех аккаунтов — добавим пояснение
+        try:
+            if assigned_accounts < len(authorized_accounts):
+                skipped = len(authorized_accounts) - assigned_accounts
+                finish_reason += f"; аккаунтов без клубов: {skipped}"
+        except Exception:
+            pass
+        self.log.emit(f"{icon} 🏁 Конец вступления: {finish_reason}. Прогресс: {processed_clubs_total}/{planned_clubs} (аккаунтов использовано: {assigned_accounts}/{len(authorized_accounts)})")
         self.task_finished.emit()
 
     def _rand_delay(self):
@@ -352,6 +483,901 @@ class Worker(QThread):
         a,b = self.jitter_ms
         return random.randint(a,b)/1000.0
 
+    def task_register_accounts(self, count: int, change_nick: bool = True, change_avatar: bool = True, words_file: Optional[str] = None, reg_proxy: Optional[str] = None, delay_min_ms: int = 400, delay_max_ms: int = 900, proxies: Optional[List[str]] = None):
+        """Сгенерировать+зарегистрировать N аккаунтов, опционально сменить ник по TCP, добавить в таблицу.
+        Работает последовательно. Задержка между шагами — случайная в заданном диапазоне.
+        Поддержка списка прокси с ротацией при "жёстких" ошибках регистрации.
+        """
+        # Сброс сигнала остановки и очистка события отмены перед стартом задачи
+        try:
+            self._stop = False
+            if hasattr(self, "_cancel_event"):
+                self._cancel_event.clear()
+        except Exception:
+            pass
+        # Настроим джиттер согласно параметрам
+        try:
+            a = int(delay_min_ms); b = int(delay_max_ms)
+            if b < a:
+                a, b = b, a
+            self.jitter_ms = (max(0, a), max(0, b))
+        except Exception:
+            self.jitter_ms = (400, 900)
+        # Подготовим генератор кредов
+        try:
+            from core.credgen import CredGenerator
+        except Exception as e:
+            self.log.emit(f"{Icons.ERROR} Не удалось импортировать генератор: {e}")
+            return
+        gen = CredGenerator(words_file=words_file)
+        import csv, datetime
+        # Набор уже пробованных имён (локально за сессию)
+        used_usernames: Set[str] = set()
+        # Нормализуем список прокси
+        proxies = [p.strip() for p in (proxies or []) if p and p.strip()]
+        proxy_count = len(proxies)
+        proxy_idx = 0 if proxy_count > 0 else -1
+        # Прокси, выбывшие по лимиту IP (20010029) в рамках этой сессии (локально)
+        ip_limit_marked: Set[str] = set()
+        def _is_ip_limit(code: int, msg: str) -> bool:
+            m = (msg or "").lower()
+            return (code == 20010029) or ("register ip limit" in m)
+        def current_proxy() -> Optional[str]:
+            nonlocal proxy_idx
+            # Если прокси выделены — выбираем ближайший не помеченный лимитом; иначе — используем общий reg_proxy
+            if proxy_count > 0:
+                if len(ip_limit_marked) >= proxy_count:
+                    return None
+                # Найти первый доступный, начиная с текущего индекса
+                for _ in range(proxy_count):
+                    p = proxies[proxy_idx]
+                    if p not in ip_limit_marked:
+                        return p
+                    # иначе — шаг вперёд и продолжим поиск
+                    proxy_idx = (proxy_idx + 1) % proxy_count
+                return None
+            return reg_proxy
+        def _classify_reason(reason: str) -> str:
+            r = (reason or "").lower()
+            # Known server/business codes
+            if "code=20010029" in reason or "register ip limit" in r:
+                return "лимит регистраций по IP (20010029)"
+            if "code=10000044" in reason or "accessdenied" in r:
+                return "запрос отклонён (10000044)"
+            if "10010008" in reason or "username unavailable" in r:
+                return "имя занято (10010008)"
+            # HTTP/transport patterns
+            if "too many 500" in r or "max retries exceeded" in r or "retry error" in r:
+                return "серверные ошибки 5xx (нестабильность)"
+            if "proxy error" in r or "proxy connect error" in r:
+                return "ошибка прокси/соединения с прокси"
+            if "connect timeout" in r or "read timed out" in r or "timed out" in r:
+                return "таймаут соединения"
+            if "connection error" in r:
+                return "ошибка соединения"
+            return reason
+        def _shorten(s: str, lim: int = 160) -> str:
+            try:
+                s = str(s)
+                return s if len(s) <= lim else (s[:lim-3] + "...")
+            except Exception:
+                return s
+        def rotate_proxy(reason: str = "") -> None:
+            nonlocal proxy_idx
+            if proxy_count <= 1:
+                return
+            # сдвигаем указатель на следующий доступный не помеченный прокси
+            for _ in range(proxy_count):
+                proxy_idx = (proxy_idx + 1) % proxy_count
+                cand = proxies[proxy_idx]
+                if cand not in ip_limit_marked:
+                    break
+            try:
+                from core.api import mask_proxy_for_log as _mask
+                newp = current_proxy()
+                masked = _mask(newp) if newp else "(нет)"
+                friendly = _classify_reason(reason)
+                if friendly and friendly != reason:
+                    self.log.emit(f"{Icons.WARNING} Смена прокси [{proxy_idx+1}/{proxy_count}] — {friendly}. Новый: {masked}")
+                else:
+                    self.log.emit(f"{Icons.WARNING} Смена прокси [{proxy_idx+1}/{proxy_count}] из-за ошибки: {_shorten(reason)}. Новый: {masked}")
+            except Exception:
+                pass
+        def is_username_busy(code: int, msg: str) -> bool:
+            msg = (msg or "").lower()
+            return code == 10010008 or "username unavailable" in msg
+        def should_rotate_on(code: int, msg: str) -> bool:
+            # Жёсткие отказы на уровне сервера / лимиты по IP
+            m = (msg or "").lower()
+            return (code in (10000044, 20010029)) or ("accessdenied" in m) or ("register ip limit" in m) or ("ip" in m and "limit" in m)
+        # Подготовим файл логирования регистраций
+        try:
+            from pathlib import Path
+            regs_path = Path('logs')/"registrations.csv"
+            regs_path.parent.mkdir(parents=True, exist_ok=True)
+            regs_file = regs_path.open('a', encoding='utf-8', newline='')
+            regs_writer = csv.writer(regs_file)
+            if regs_path.stat().st_size == 0:
+                regs_writer.writerow(["ts","username","password","nick","device_id","code","msg","uid"])
+        except Exception:
+            regs_file = None
+            regs_writer = None
+        # Счётчики прогресса
+        processed_total = 0
+        success_total = 0
+        fail_total = 0
+        finished_cause = ""
+        for i in range(int(count)):
+            if self._stop:
+                finished_cause = "Остановлено пользователем"
+                break
+            try:
+                # Генерируем логин/ник/пароль (логин можно ретраить при 10010008)
+                username = gen.generate_login(min_len=8, max_len=16)
+                while username in used_usernames:
+                    username = gen.generate_login(min_len=8, max_len=16)
+                used_usernames.add(username)
+                nick = gen.derive_nick(username, min_len=6, max_len=20)
+                password = gen.generate_password(min_len=6, max_len=16)
+                # device_id для X-Poker — UUID4
+                import uuid
+                device_id = str(uuid.uuid4())
+                self.log.emit(f"{Icons.PROCESS} Регистрация [{i+1}/{count}] {username}")
+                # Параметры ретраев
+                max_username_retries = 10
+                username_attempt = 0
+                uid = None
+                code = -1
+                msg = ''
+                data = {}
+                # Выбор текущего прокси (учитывая пометки IP Limit)
+                curp = current_proxy()
+                if proxy_count > 0 and curp is None:
+                    # Все прокси в списке помечены лимитом ip — прекращаем дальнейшие попытки
+                    self.log.emit(f"{Icons.WARNING} Все прокси помечены как 'Register IP Limit' — пропускаем оставшиеся регистрации")
+                    # прерываем внешний цикл по аккаунтам
+                    break
+                api = self.api_class(proxy=curp)
+                try:
+                    self._live_apis.add(api)
+                except Exception:
+                    pass
+                # UI: покажем, через какой прокси идёт HTTP (маскируем пароль)
+                try:
+                    from core.api import mask_proxy_for_log as _mask
+                    if curp:
+                        self.log.emit(f"{Icons.INFO} HTTP через прокси: {_mask(curp)}")
+                    else:
+                        self.log.emit(f"{Icons.INFO} HTTP без прокси")
+                except Exception:
+                    pass
+                # Внутренний цикл: пытаемся регистрировать, при нужных ошибках — ротация прокси (не меняя username)
+                rotated = 0
+                while True:
+                    # Ограничение на полные круги по прокси, чтобы не зациклиться
+                    if rotated > proxy_count and proxy_count > 0:
+                        break
+                    try:
+                        data = api.register(username=username, password=password, device_id=device_id)
+                        code = int(data.get('code', -1)) if isinstance(data, dict) else -1
+                        msg = str(data.get('msg', '')) if isinstance(data, dict) else ''
+                    except self.api_error_class as e:
+                        # Ошибка уровня сети/прокси — пробуем ротацию
+                        code = -1
+                        msg = str(e)
+                        # Если это серия серверных 5xx (исчерпаны ретраи) — делаем паузу 60с перед повторами
+                        try:
+                            mlow = (msg or "").lower()
+                            if ("too many 500" in mlow) or ("max retries exceeded" in mlow) or ("retry error" in mlow):
+                                self.log.emit(f"{Icons.WARNING} Серверные 5xx — исчерпаны повторы (2 шт, задержка ≈3с). Пауза 20с перед следующей попыткой")
+                                for _ in range(20):
+                                    if self._stop:
+                                        break
+                                    time.sleep(1.0)
+                        except Exception:
+                            pass
+                        if proxy_count > 0:
+                            rotate_proxy(msg)
+                            api = self.api_class(proxy=current_proxy())
+                            try:
+                                self._live_apis.add(api)
+                            except Exception:
+                                pass
+                            rotated += 1
+                            time.sleep(self._rand_delay())
+                            continue
+                        else:
+                            # Без прокси — считаем фатально для этой попытки
+                            break
+                    except Exception as e:
+                        code = -1
+                        msg = str(e)
+                        # Если получили исчерпание ретраев (частые 500/429) — пауза 60с и, при наличии, смена прокси
+                        mlow = (msg or "").lower()
+                        if ("max retries exceeded" in mlow or "too many 500" in mlow or "retry error" in mlow):
+                            try:
+                                self.log.emit(f"{Icons.WARNING} Серверные 5xx — исчерпаны повторы (2 шт, задержка ≈3с). Пауза 20с перед следующей попыткой")
+                                for _ in range(20):
+                                    if self._stop:
+                                        break
+                                    time.sleep(1.0)
+                            except Exception:
+                                pass
+                            if proxy_count > 0:
+                                rotate_proxy(f"{msg}")
+                                api = self.api_class(proxy=current_proxy())
+                                try:
+                                    self._live_apis.add(api)
+                                except Exception:
+                                    pass
+                                rotated += 1
+                                time.sleep(self._rand_delay())
+                                continue
+                        break
+                    # Успех
+                    if code == 0:
+                        break
+                    # Имя занято — меняем имя, НЕ меняем прокси
+                    if is_username_busy(code, msg):
+                        if username_attempt + 1 >= max_username_retries:
+                            self.log.emit(f"{Icons.ERROR} Слишком много коллизий имени для {username} — пропускаем")
+                            break
+                        old_username = username
+                        try:
+                            used_usernames.add(old_username)
+                        except Exception:
+                            pass
+                        # Увеличиваем длину/уникальность с каждой попыткой
+                        username = gen.generate_login(min_len=min(16, 8 + username_attempt), max_len=16)
+                        while username in used_usernames:
+                            username = gen.generate_login(min_len=min(16, 8 + username_attempt), max_len=16)
+                        used_usernames.add(username)
+                        nick = gen.derive_nick(username, min_len=6, max_len=20)
+                        username_attempt += 1
+                        self.log.emit(f"{Icons.WARNING} Имя занято: {old_username} → новая попытка: {username} ({username_attempt}/{max_username_retries})")
+                        # остаёмся на том же прокси, пауза
+                        time.sleep(self._rand_delay())
+                        continue
+                    # Жёсткая ошибка — пробуем сменить прокси (если есть)
+                    if proxy_count > 0 and should_rotate_on(code, msg):
+                        # Помечаем прокси, если это именно лимит IP
+                        if _is_ip_limit(code, msg) and curp:
+                            try:
+                                ip_limit_marked.add(curp)
+                                from core.api import mask_proxy_for_log as _mask
+                                self.log.emit(f"{Icons.INFO} Пометка прокси как 'Register IP Limit': {_mask(curp)} — будет пропускаться")
+                            except Exception:
+                                pass
+                        rotate_proxy(f"code={code} msg={msg}")
+                        curp = current_proxy()
+                        if curp is None:
+                            self.log.emit(f"{Icons.WARNING} Все прокси помечены как 'Register IP Limit' — прекращаем попытку")
+                            break
+                        api = self.api_class(proxy=curp)
+                        rotated += 1
+                        time.sleep(self._rand_delay())
+                        continue
+                    # Прочая ошибка — выходим
+                    break
+                # Лог в CSV (итог)
+                try:
+                    if regs_writer:
+                        regs_writer.writerow([
+                            datetime.datetime.utcnow().isoformat(), username, password, nick, device_id, code, msg, ''
+                        ])
+                        regs_file.flush()
+                except Exception:
+                    pass
+                if code != 0:
+                    fail_total += 1
+                    processed_total += 1
+                    self.log.emit(f"{Icons.ERROR} Регистрация {username} отклонена: code={code} msg={msg}")
+                    time.sleep(self._rand_delay())
+                    continue
+                # Пытаемся извлечь uid и токен
+                uid = api.get_uid_from_login_response(data)
+                if not api.token:
+                    try:
+                        data_login = api.login(username=username, password=password, device_id=device_id)
+                        uid = uid or api.get_uid_from_login_response(data_login)
+                    except Exception as e:
+                        self.log.emit(f"{Icons.ERROR} Повторный login после регистрации не удался: {e}")
+                # Смена ника и/или аватара по TCP (в зависимости от настроек) с ретраями и ротацией endpoint'ов
+                if (change_nick or change_avatar) and api.token and uid:
+                    from core.constants import CLUB_SERVER_HOST, CLUB_SERVER_PORT, DEFAULT_AVATAR_URLS
+                    # Подготовим список TCP endpoint'ов из HTTP-ответа; иначе — дефолт
+                    endpoints: list[tuple[str,int]] = []
+                    try:
+                        eps = list(getattr(api, 'tcp_entries', []) or [])
+                        for ep in eps:
+                            try:
+                                h, p = ep
+                                endpoints.append((str(h), int(p or 5000)))
+                            except Exception:
+                                pass
+                    except Exception:
+                        endpoints = []
+                    if not endpoints:
+                        host = getattr(api, 'tcp_host', None) or CLUB_SERVER_HOST
+                        port = int(getattr(api, 'tcp_port', None) or CLUB_SERVER_PORT)
+                        endpoints = [(host, port)]
+                    # URL аватарки (если требуется)
+                    avatar_url = None
+                    if change_avatar:
+                        try:
+                            avatar_url = DEFAULT_AVATAR_URLS[0] if DEFAULT_AVATAR_URLS else None
+                        except Exception:
+                            avatar_url = None
+                        if not avatar_url:
+                            self.log.emit(f"{Icons.INFO} Смена аватара [{username}]: пропущено (нет URL по умолчанию)")
+                    # Ретраи TCP: до 3 попыток, с ротацией endpoint'ов
+                    max_attempts = max(1, min(3, 1 + len(endpoints)))
+                    ok_name = (not change_nick)
+                    ok_av = (not change_avatar) or (avatar_url is None)
+                    for attempt_n in range(1, max_attempts+1):
+                        if self._stop:
+                            break
+                        ehost, eport = endpoints[(attempt_n-1) % len(endpoints)]
+                        fallbacks = [ep for ep in endpoints if ep != (ehost, eport)]
+                        tcp = None
+                        try:
+                            self.log.emit(f"{Icons.PROCESS} TCP попытка {attempt_n}/{max_attempts} для [{username}] через {ehost}:{eport}")
+                            tcp = XClubTCPClient(host=ehost, port=eport, timeout=3.5, proxy=api.proxy_url, disable_bootstrap=True, frida_strict=True, fallback_endpoints=fallbacks)
+                            try:
+                                tcp.set_cancel_event(self._cancel_event)
+                            except Exception:
+                                pass
+                            try:
+                                self._live_tcps.add(tcp)
+                            except Exception:
+                                pass
+                            tcp.connect()
+                            _ = tcp.tcp_login(uid=int(uid), token=api.token)
+                            if change_nick and not ok_name:
+                                ok, cmsg = tcp.change_name(nick)
+                                self.log.emit(f"{Icons.INFO} Смена ника [{username}] → '{nick}': {'успех' if ok else cmsg}")
+                                ok_name = ok or ok_name
+                            if change_avatar and avatar_url and not ok_av:
+                                ok_av1, msg_av = tcp.change_avatar(avatar_url)
+                                self.log.emit(f"{Icons.INFO} Смена аватара [{username}] → '{avatar_url}': {'успех' if ok_av1 else msg_av}")
+                                ok_av = ok_av1 or ok_av
+                            if ok_name and ok_av:
+                                break
+                        except Exception as e:
+                            self.log.emit(f"{Icons.WARNING} TCP попытка {attempt_n}/{max_attempts} для [{username}] не удалась: {e}")
+                        finally:
+                            try:
+                                if tcp is not None:
+                                    tcp.close()
+                                try:
+                                    if tcp is not None:
+                                        self._live_tcps.discard(tcp)
+                                except Exception:
+                                    pass
+                            except Exception:
+                                pass
+                        # Пауза между повторами
+                        time.sleep(self._rand_delay())
+                    if not (ok_name and ok_av):
+                        self.log.emit(f"{Icons.WARNING} Не удалось полностью применить TCP-изменения для [{username}] (ник={'ok' if ok_name else 'fail'}, аватар={'ok' if ok_av else 'fail'})")
+                # Создаём Account и отдаём в UI
+                acc = Account(username=username, password=password, device_id=device_id)
+                acc.proxy = api.proxy_url
+                acc.token = api.token
+                acc.refresh_token = api.refresh_token
+                acc.access_token_expire = api.access_token_expire
+                acc.refresh_token_expire = api.refresh_token_expire
+                acc.uid = int(uid) if uid else None
+                acc.last_login_at = time.time()
+                try:
+                    acc.headers = api.session.headers.copy() if hasattr(api, 'session') else {}
+                except Exception:
+                    acc.headers = {}
+                # Обновим CSV uid (допишем success)
+                try:
+                    if regs_writer:
+                        regs_writer.writerow([
+                            datetime.datetime.utcnow().isoformat(), username, password, nick, device_id, 0, 'Success', acc.uid or ''
+                        ])
+                        regs_file.flush()
+                except Exception:
+                    pass
+                self.log.emit(f"{Icons.SUCCESS} Зарегистрирован аккаунт: {username} (uid={acc.uid})")
+                self.new_account.emit(acc)
+                success_total += 1
+                processed_total += 1
+            except Exception as e:
+                self.log.emit(f"{Icons.ERROR} Ошибка на шаге регистрации: {e}")
+            time.sleep(self._rand_delay())
+        try:
+            if regs_file:
+                regs_file.close()
+        except Exception:
+            pass
+        # Финальный отчёт
+        try:
+            total_target = int(count)
+        except Exception:
+            total_target = 0
+        if not finished_cause:
+            if proxy_count > 0 and len(ip_limit_marked) >= proxy_count:
+                finished_cause = "Все прокси помечены как 'Register IP Limit'"
+            else:
+                finished_cause = "Все задачи выполнены"
+        icon = Icons.SUCCESS if processed_total >= total_target and finished_cause == "Все задачи выполнены" else Icons.WARNING if "Register IP Limit" in finished_cause else Icons.INFO
+        self.log.emit(f"{icon} 🏁 Конец: {finished_cause}. Прогресс: {processed_total}/{total_target} (успешно: {success_total}, ошибки: {fail_total})")
+
+
+    def task_register_accounts_parallel(self, count: int, change_nick: bool = True, change_avatar: bool = True, words_file: Optional[str] = None, reg_proxy: Optional[str] = None, delay_min_ms: int = 400, delay_max_ms: int = 900, proxies: Optional[List[str]] = None, threads: int = 1, proxies_per_thread: int = 0):
+        """Параллельная регистрация аккаунтов с разбиением по потокам и спискам прокси.
+        - threads: количество потоков (>=1)
+        - proxies_per_thread: сколько прокси выделить на поток (0 = авто-деление)
+        Прочая логика (ретраи, CSV, смена ника/аватара, cooldown на 5xx) совпадает с последовательной.
+        """
+        # Сброс сигнала остановки и очистка события отмены перед стартом задачи
+        try:
+            self._stop = False
+            if hasattr(self, "_cancel_event"):
+                self._cancel_event.clear()
+        except Exception:
+            pass
+        try:
+            threads = max(1, int(threads))
+        except Exception:
+            threads = 1
+        # Если один поток — используем стандартную последовательную реализацию
+        if threads <= 1:
+            return self.task_register_accounts(count, change_nick, change_avatar, words_file, reg_proxy, delay_min_ms, delay_max_ms, proxies)
+        # Установим общий джиттер
+        try:
+            a = int(delay_min_ms); b = int(delay_max_ms)
+            if b < a: a,b = b,a
+            self.jitter_ms = (max(0,a), max(0,b))
+        except Exception:
+            self.jitter_ms = (400,900)
+        import threading
+        from pathlib import Path
+        # Подготовим CSV writer один раз и общий лок
+        regs_path = Path('logs')/"registrations.csv"
+        regs_path.parent.mkdir(parents=True, exist_ok=True)
+        regs_file = regs_path.open('a', encoding='utf-8', newline='')
+        import csv, datetime, random
+        regs_writer = csv.writer(regs_file)
+        if regs_path.stat().st_size == 0:
+            regs_writer.writerow(["ts","username","password","nick","device_id","code","msg","uid"])
+        csv_lock = threading.Lock()
+        # Разобьём количество по потокам
+        total = int(count)
+        base = total // threads
+        rem = total % threads
+        counts = [base + (1 if i < rem else 0) for i in range(threads)]
+        # Подготовим группы прокси
+        proxies_all = [p.strip() for p in (proxies or []) if p and p.strip()]
+        random.shuffle(proxies_all)
+        ppt = max(0, int(proxies_per_thread))
+        proxy_groups: list[list[str]] = []
+        if ppt > 0 and proxies_all:
+            # Уникальное распределение без повторов между потоками
+            n = len(proxies_all)
+            needed = threads * ppt
+            if n < needed:
+                try:
+                    self.log.emit(f"{Icons.WARNING} Прокси меньше, чем требуется ({n} < {needed}); распределяем без повторов, часть потоков получит меньше прокси")
+                except Exception:
+                    pass
+            it = iter(proxies_all)
+            for i in range(threads):
+                grp = []
+                for k in range(ppt):
+                    try:
+                        grp.append(next(it))
+                    except StopIteration:
+                        break
+                proxy_groups.append(grp)
+        else:
+            # Авто-деление: равномерные чанки (также без повторов между потоками)
+            if proxies_all:
+                chunk = (len(proxies_all) + threads - 1)//threads
+                for i in range(threads):
+                    s = i*chunk; e = min(len(proxies_all), (i+1)*chunk)
+                    proxy_groups.append(proxies_all[s:e])
+            else:
+                proxy_groups = [[] for _ in range(threads)]
+        # Глобальная пометка IP Limit прокси (на случай дубликатов между группами)
+        import threading, queue
+        ip_limit_global: Set[str] = set()
+        ip_lock = threading.Lock()
+        # Глобальный набор уже занятых/использованных имён пользователя, чтобы не генерить повторно между потоками
+        usernames_global: Set[str] = set()
+        usernames_lock = threading.Lock()
+        def _global_mark_ip_limit(p: Optional[str]):
+            if not p: return
+            try:
+                with ip_lock:
+                    ip_limit_global.add(p)
+            except Exception:
+                pass
+        def _global_is_marked(p: Optional[str]) -> bool:
+            if not p: return False
+            try:
+                with ip_lock:
+                    return p in ip_limit_global
+            except Exception:
+                return False
+        # Общая очередь задач (динамическое перераспределение)
+        job_queue: "queue.Queue[int]" = queue.Queue()
+        total = int(count)
+        for j in range(total):
+            job_queue.put(j+1)
+            # Глобальные счётчики прогресса
+        counts_lock = threading.Lock()
+        processed_total = 0
+        success_total = 0
+        fail_total = 0
+        # Внутренняя функция — одна рабочая нить (вытягивает задачи из общей очереди)
+        def worker_fn(worker_idx: int, pgroup: list[str], q: "queue.Queue[int]"):
+            nonlocal processed_total, success_total, fail_total
+            # Локальный генератор
+            try:
+                from core.credgen import CredGenerator
+                gen = CredGenerator(words_file=words_file)
+            except Exception as e:
+                self.log.emit(f"{Icons.ERROR} [T{worker_idx}] Генератор недоступен: {e}")
+                return
+            # Индексы по прокси и пометки лимита
+            proxy_count = len(pgroup)
+            proxy_idx = 0 if proxy_count>0 else -1
+            ip_limit_local: Set[str] = set()
+            def current_proxy() -> Optional[str]:
+                nonlocal proxy_idx
+                # Если группа пуста — используем общий reg_proxy; иначе ищем не помеченный локально/глобально
+                if proxy_count == 0:
+                    return reg_proxy
+                if len(ip_limit_local) >= proxy_count:
+                    return None
+                for _ in range(proxy_count):
+                    p = pgroup[proxy_idx]
+                    if p not in ip_limit_local and not _global_is_marked(p):
+                        return p
+                    # иначе — шаг вперёд
+                    proxy_idx = (proxy_idx + 1) % proxy_count
+                return None
+            def rotate_proxy_local(reason: str = "") -> None:
+                nonlocal proxy_idx
+                if proxy_count <= 1:
+                    return
+                for _ in range(proxy_count):
+                    proxy_idx = (proxy_idx + 1) % proxy_count
+                    cand = pgroup[proxy_idx]
+                    if cand not in ip_limit_local and not _global_is_marked(cand):
+                        break
+                try:
+                    from core.api import mask_proxy_for_log as _mask
+                    newp = current_proxy()
+                    masked = _mask(newp) if newp else "(нет)"
+                    self.log.emit(f"{Icons.WARNING} [T{worker_idx}] Смена прокси [{proxy_idx+1}/{proxy_count}] — {reason}. Новый: {masked}")
+                except Exception:
+                    pass
+            def is_username_busy(code: int, msg: str) -> bool:
+                m = (msg or "").lower()
+                return code == 10010008 or "username unavailable" in m
+            def should_rotate_on(code: int, msg: str) -> bool:
+                m = (msg or "").lower()
+                return (code in (10000044, 20010029)) or ("accessdenied" in m) or ("register ip limit" in m)
+            def _is_ip_limit(code: int, msg: str) -> bool:
+                m = (msg or "").lower()
+                return (code == 20010029) or ("register ip limit" in m)
+            done_local = 0
+            # Локальный набор тоже, чтобы избежать лишних попыток внутри потока
+            used_local: Set[str] = set()
+            while not self._stop:
+                try:
+                    token = q.get_nowait()
+                except queue.Empty:
+                    break
+                requeue_token = False
+                try:
+                    # Сначала резервируем уникальное имя глобально
+                    while True:
+                        candidate = gen.generate_login(min_len=8, max_len=16)
+                        with usernames_lock:
+                            if candidate not in usernames_global:
+                                usernames_global.add(candidate)
+                                break
+                    username = candidate
+                    used_local.add(username)
+                    nick = gen.derive_nick(username, min_len=6, max_len=20)
+                    password = gen.generate_password(min_len=6, max_len=16)
+                    import uuid
+                    device_id = str(uuid.uuid4())
+                    self.log.emit(f"{Icons.PROCESS} [T{worker_idx}] Регистрация [{done_local+1}] {username}")
+                    max_username_retries = 5
+                    username_attempt = 0
+                    code = -1; msg = ''
+                    uid = None
+                    data = {}
+                    # Выбор прокси с учётом пометок
+                    curp = current_proxy()
+                    if proxy_count>0 and curp is None:
+                        # Все прокси в группе выведены из работы — возвращаем задачу и завершаем поток
+                        self.log.emit(f"{Icons.WARNING} [T{worker_idx}] Все прокси помечены как 'Register IP Limit' — поток завершает работу, задача будет передана другим потокам")
+                        requeue_token = True
+                        break
+                    api = self.api_class(proxy=curp)
+                    try:
+                        self._live_apis.add(api)
+                    except Exception:
+                        pass
+                    # UI: прокси для потока
+                    try:
+                        from core.api import mask_proxy_for_log as _mask
+                        if curp:
+                            self.log.emit(f"{Icons.INFO} [T{worker_idx}] HTTP через прокси: {_mask(curp)}")
+                        else:
+                            self.log.emit(f"{Icons.INFO} [T{worker_idx}] HTTP без прокси")
+                    except Exception:
+                        pass
+                    rotated = 0
+                    while True:
+                        if rotated > proxy_count and proxy_count>0:
+                            break
+                        try:
+                            data = api.register(username=username, password=password, device_id=device_id)
+                            code = int(data.get('code', -1)) if isinstance(data, dict) else -1
+                            msg = str(data.get('msg','')) if isinstance(data, dict) else ''
+                        except self.api_error_class as e:
+                            code = -1; msg = str(e)
+                            mlow = (msg or "").lower()
+                            if ("too many 500" in mlow) or ("max retries exceeded" in mlow) or ("retry error" in mlow):
+                                self.log.emit(f"{Icons.WARNING} [T{worker_idx}] Серверные 5xx — исчерпаны повторы (2 шт, задержка ≈3с). Пауза 20с")
+                                for _ in range(20):
+                                    if self._stop: break
+                                    time.sleep(1.0)
+                            if proxy_count>0:
+                                rotate_proxy_local(msg)
+                                curp = current_proxy()
+                                api = self.api_class(proxy=curp)
+                                try:
+                                    self._live_apis.add(api)
+                                except Exception:
+                                    pass
+                                rotated += 1
+                                time.sleep(self._rand_delay())
+                                continue
+                            else:
+                                break
+                        except Exception as e:
+                            code = -1; msg = str(e)
+                            mlow = (msg or "").lower()
+                            if ("too many 500" in mlow) or ("max retries exceeded" in mlow) or ("retry error" in mlow):
+                                self.log.emit(f"{Icons.WARNING} [T{worker_idx}] Серверные 5xx — исчерпаны повторы (2 шт, задержка ≈3с). Пауза 20с")
+                                for _ in range(20):
+                                    if self._stop: break
+                                    time.sleep(1.0)
+                                if proxy_count>0:
+                                    rotate_proxy_local(msg)
+                                    curp = current_proxy()
+                                    api = self.api_class(proxy=curp)
+                                    try:
+                                        self._live_apis.add(api)
+                                    except Exception:
+                                        pass
+                                    rotated += 1
+                                    time.sleep(self._rand_delay())
+                                    continue
+                            break
+                        if code == 0:
+                            break
+                        if is_username_busy(code, msg):
+                            if username_attempt + 1 >= max_username_retries:
+                                self.log.emit(f"{Icons.ERROR} [T{worker_idx}] Слишком много коллизий имени для {username} — пропускаем задачу")
+                                break
+                            old_username = username
+                            try:
+                                with usernames_lock:
+                                    usernames_global.add(old_username)
+                                used_local.add(old_username)
+                            except Exception:
+                                pass
+                            # Эскалация длины/уникальности с каждой попыткой
+                            while True:
+                                candidate = gen.generate_login(min_len=min(16, 8 + username_attempt), max_len=16)
+                                with usernames_lock:
+                                    if candidate not in usernames_global:
+                                        usernames_global.add(candidate)
+                                        break
+                            username = candidate
+                            used_local.add(username)
+                            nick = gen.derive_nick(username, min_len=6, max_len=20)
+                            username_attempt += 1
+                            self.log.emit(f"{Icons.WARNING} [T{worker_idx}] Имя занято: {old_username} → новая попытка: {username} ({username_attempt}/{max_username_retries})")
+                            time.sleep(self._rand_delay())
+                            continue
+                        if proxy_count > 0 and should_rotate_on(code, msg):
+                            # Если это лимит IP — помечаем локально и глобально
+                            if _is_ip_limit(code, msg) and curp:
+                                try:
+                                    ip_limit_local.add(curp)
+                                    _global_mark_ip_limit(curp)
+                                    from core.api import mask_proxy_for_log as _mask
+                                    self.log.emit(f"{Icons.INFO} [T{worker_idx}] Пометка прокси как 'Register IP Limit': {_mask(curp)} — будет пропускаться в этом и других потоках")
+                                except Exception:
+                                    pass
+                            rotate_proxy_local(f"code={code} msg={msg}")
+                            curp = current_proxy()
+                            if proxy_count>0 and curp is None:
+                                # Все прокси выведены — ре-доставим задачу в очередь и завершим поток
+                                requeue_token = True
+                                self.log.emit(f"{Icons.WARNING} [T{worker_idx}] Все прокси помечены как 'Register IP Limit' — задача будет передана другим потокам")
+                                break
+                            api = self.api_class(proxy=curp)
+                            rotated += 1
+                            time.sleep(self._rand_delay())
+                            continue
+                        break
+                    # Запись результата
+                    try:
+                        with csv_lock:
+                            regs_writer.writerow([datetime.datetime.utcnow().isoformat(), username, password, nick, device_id, code, msg, ''])
+                            regs_file.flush()
+                    except Exception:
+                        pass
+                    if code != 0:
+                        self.log.emit(f"{Icons.ERROR} [T{worker_idx}] Регистрация {username} отклонена: code={code} msg={msg}")
+                        # задача считается выполненной (попытка была), не возвращаем в очередь
+                        with counts_lock:
+                            fail_total += 1
+                            processed_total += 1
+                        time.sleep(self._rand_delay())
+                        done_local += 1
+                        q.task_done()
+                        continue
+                    # Успех: uid/token
+                    try:
+                        uid = self.api_class().get_uid_from_login_response(data)
+                    except Exception:
+                        uid = None
+                    if not api.token:
+                        try:
+                            data_login = api.login(username=username, password=password, device_id=device_id)
+                            uid = uid or api.get_uid_from_login_response(data_login)
+                        except Exception as e:
+                            self.log.emit(f"{Icons.ERROR} [T{worker_idx}] Повторный login после регистрации не удался: {e}")
+                    if (change_nick or change_avatar) and api.token and uid:
+                        from core.constants import CLUB_SERVER_HOST, CLUB_SERVER_PORT, DEFAULT_AVATAR_URLS
+                        endpoints = []
+                        try:
+                            eps = list(getattr(api,'tcp_entries',[]) or [])
+                            for ep in eps:
+                                try:
+                                    h,p = ep; endpoints.append((str(h), int(p or 5000)))
+                                except Exception:
+                                    pass
+                        except Exception:
+                            endpoints = []
+                        if not endpoints:
+                            host = getattr(api,'tcp_host',None) or CLUB_SERVER_HOST
+                            port = int(getattr(api,'tcp_port',None) or CLUB_SERVER_PORT)
+                            endpoints = [(host,port)]
+                        avatar_url = None
+                        if change_avatar:
+                            try:
+                                avatar_url = DEFAULT_AVATAR_URLS[0] if DEFAULT_AVATAR_URLS else None
+                            except Exception:
+                                avatar_url = None
+                            if not avatar_url:
+                                self.log.emit(f"{Icons.INFO} [T{worker_idx}] Смена аватара [{username}]: пропущено (нет URL по умолчанию)")
+                        max_attempts = max(1, min(3, 1+len(endpoints)))
+                        ok_name = (not change_nick)
+                        ok_av = (not change_avatar) or (avatar_url is None)
+                        for attempt_n in range(1, max_attempts+1):
+                            if self._stop: break
+                            ehost, eport = endpoints[(attempt_n-1)%len(endpoints)]
+                            fallbacks = [ep for ep in endpoints if ep != (ehost,eport)]
+                            tcp = None
+                            try:
+                                self.log.emit(f"{Icons.PROCESS} [T{worker_idx}] TCP попытка {attempt_n}/{max_attempts} для [{username}] через {ehost}:{eport}")
+                                tcp = XClubTCPClient(host=ehost, port=eport, timeout=3.5, proxy=api.proxy_url, disable_bootstrap=True, frida_strict=True, fallback_endpoints=fallbacks)
+                                try:
+                                    tcp.set_cancel_event(self._cancel_event)
+                                except Exception:
+                                    pass
+                                try:
+                                    self._live_tcps.add(tcp)
+                                except Exception:
+                                    pass
+                                tcp.connect(); _ = tcp.tcp_login(uid=int(uid), token=api.token)
+                                if change_nick and not ok_name:
+                                    ok, cmsg = tcp.change_name(nick)
+                                    self.log.emit(f"{Icons.INFO} [T{worker_idx}] Смена ника [{username}] → '{nick}': {'успех' if ok else cmsg}")
+                                    ok_name = ok or ok_name
+                                if change_avatar and avatar_url and not ok_av:
+                                    ok_av1, msg_av = tcp.change_avatar(avatar_url)
+                                    self.log.emit(f"{Icons.INFO} [T{worker_idx}] Смена аватара [{username}] → '{avatar_url}': {'успех' if ok_av1 else msg_av}")
+                                    ok_av = ok_av1 or ok_av
+                                if ok_name and ok_av:
+                                    break
+                            except Exception as e:
+                                self.log.emit(f"{Icons.WARNING} [T{worker_idx}] TCP попытка {attempt_n}/{max_attempts} для [{username}] не удалась: {e}")
+                            finally:
+                                try:
+                                    if tcp is not None: tcp.close()
+                                    try:
+                                        if tcp is not None:
+                                            self._live_tcps.discard(tcp)
+                                    except Exception:
+                                        pass
+                                except Exception:
+                                    pass
+                            time.sleep(self._rand_delay())
+                        if not (ok_name and ok_av):
+                            self.log.emit(f"{Icons.WARNING} [T{worker_idx}] Не удалось применить TCP-изменения для [{username}] (ник={'ok' if ok_name else 'fail'}, аватар={'ok' if ok_av else 'fail'})")
+                    # Создаём Account + эмитим
+                    acc = Account(username=username, password=password, device_id=device_id)
+                    acc.proxy = api.proxy_url
+                    acc.token = api.token
+                    acc.refresh_token = api.refresh_token
+                    acc.access_token_expire = api.access_token_expire
+                    acc.refresh_token_expire = api.refresh_token_expire
+                    acc.uid = int(uid) if uid else None
+                    acc.last_login_at = time.time()
+                    try:
+                        acc.headers = api.session.headers.copy() if hasattr(api,'session') else {}
+                    except Exception:
+                        acc.headers = {}
+                    try:
+                        with csv_lock:
+                            regs_writer.writerow([datetime.datetime.utcnow().isoformat(), username, password, nick, device_id, 0, 'Success', acc.uid or ''])
+                            regs_file.flush()
+                    except Exception:
+                        pass
+                    self.log.emit(f"{Icons.SUCCESS} [T{worker_idx}] Зарегистрирован аккаунт: {username} (uid={acc.uid})")
+                    self.new_account.emit(acc)
+                    with counts_lock:
+                        success_total += 1
+                        processed_total += 1
+                    done_local += 1
+                    q.task_done()
+                finally:
+                    if requeue_token:
+                        try:
+                            q.put(token)
+                        except Exception:
+                            pass
+                        # Выходим из потока — оставшиеся задачи возьмут другие
+                        break
+                time.sleep(self._rand_delay())
+        # Запуск потоков
+        ths = []
+        for t in range(threads):
+            pg = proxy_groups[t] if t < len(proxy_groups) else []
+            th = threading.Thread(target=worker_fn, args=(t+1, pg, job_queue), daemon=True)
+            th.start(); ths.append(th)
+        # Ждём завершения
+        for th in ths:
+            th.join()
+        # Финальный отчёт по параллельной регистрации
+        remaining = 0
+        try:
+            remaining = job_queue.qsize()
+        except Exception:
+            remaining = 0
+        total_planned = int(count)
+        reason = ""
+        if self._stop:
+            reason = "Остановлено пользователем"
+        elif proxies_all and len(ip_limit_global) >= len(proxies_all) and remaining > 0:
+            reason = f"Все прокси помечены как 'Register IP Limit' — осталось задач: {remaining}"
+        elif remaining == 0:
+            reason = "Все задачи выполнены"
+        else:
+            reason = f"Потоки завершены, но остались задачи: {remaining} (возможна нехватка рабочих прокси)"
+        icon = Icons.SUCCESS if remaining == 0 and processed_total >= total_planned else Icons.WARNING if "Register IP Limit" in reason else Icons.INFO
+        self.log.emit(f"{icon} 🏁 Конец: {reason}. Прогресс: {processed_total}/{total_planned} (успешно: {success_total}, ошибки: {fail_total}). IP Limit помечено: {len(ip_limit_global)}/{len(proxies_all)} прокси")
+        try:
+            regs_file.close()
+        except Exception:
+            pass
 
 class AccountDialog(QDialog):
     """Диалог для добавления/редактирования аккаунта."""
@@ -594,7 +1620,7 @@ class DebugTCPDialog(QDialog):
             return False
             
         if not club_id_text.isdigit():
-            QMessageBox.warning(self, "Ошибка", "ID клуба должен быть числом!")
+            QMessageBox.warning(self, "Ошибка", "ID клуба должен содержать только цифры!")
             self.club_id_edit.setFocus()
             return False
             
@@ -603,6 +1629,77 @@ class DebugTCPDialog(QDialog):
     def accept(self):
         if self.validate():
             super().accept()
+
+
+class GenerateAccountsDialog(QDialog):
+    """Диалог генерации аккаунтов.
+    Поля:
+    - Количество
+    - Список прокси (по одному на строке)
+    - Задержка MIN (мс)
+    - Задержка MAX (мс)
+    - Добавить аватарку (по умолчанию включено)
+    """
+    def __init__(self, *, default_count: int = 100, default_proxies_text: str = "", default_dmin: int = 400, default_dmax: int = 900, default_set_avatar: bool = True, default_threads: int = 1, default_ppt: int = 0, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Сгенерировать аккаунты")
+        self.setModal(True)
+        self.resize(560, 420)
+        v = QVBoxLayout(self)
+        form = QFormLayout()
+        # Кол-во
+        self.spn_count = QSpinBox(); self.spn_count.setRange(1, 500000); self.spn_count.setValue(int(max(1, min(500000, default_count))))
+        form.addRow("Количество:", self.spn_count)
+        # Прокси (многострочный ввод)
+        self.txt_proxies = QPlainTextEdit();
+        self.txt_proxies.setPlaceholderText("Каждый прокси на новой строке:\nuser:pass@host:port\nили host:port\n(схема auto: http/socks5h)")
+        self.txt_proxies.setPlainText(default_proxies_text or "")
+        self.txt_proxies.setMinimumHeight(120)
+        form.addRow("Прокси (список):", self.txt_proxies)
+        # Опции параллелизма
+        par_row = QHBoxLayout()
+        self.spn_threads = QSpinBox(); self.spn_threads.setRange(1, 64); self.spn_threads.setValue(max(1, int(default_threads)))
+        self.spn_ppt = QSpinBox(); self.spn_ppt.setRange(0, 1000); self.spn_ppt.setValue(max(0, int(default_ppt)))
+        par_row.addWidget(QLabel("Потоков:")); par_row.addWidget(self.spn_threads)
+        par_row.addSpacing(16)
+        par_row.addWidget(QLabel("Прокси на поток (0=авто):")); par_row.addWidget(self.spn_ppt)
+        form.addRow("Параллелизм:", par_row)
+        # Опция: добавить аватарку
+        self.chk_set_avatar = QCheckBox("Добавить аватарку")
+        self.chk_set_avatar.setChecked(bool(default_set_avatar))
+        form.addRow("Добавить аватарку:", self.chk_set_avatar)
+        # Задержки
+        delays_row = QHBoxLayout()
+        self.spn_delay_min = QSpinBox(); self.spn_delay_min.setRange(0, 600000); self.spn_delay_min.setValue(max(0, int(default_dmin)))
+        self.spn_delay_max = QSpinBox(); self.spn_delay_max.setRange(0, 600000); self.spn_delay_max.setValue(max(0, int(default_dmax)))
+        delays_row.addWidget(QLabel("Мин (мс):")); delays_row.addWidget(self.spn_delay_min)
+        delays_row.addSpacing(16)
+        delays_row.addWidget(QLabel("Макс (мс):")); delays_row.addWidget(self.spn_delay_max)
+        form.addRow("Задержка между запросами:", delays_row)
+        v.addLayout(form)
+        # Кнопки
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        v.addWidget(buttons)
+
+    def get_values(self) -> tuple[int, list[str], int, int, bool, int, int]:
+        try:
+            cnt = int(self.spn_count.value())
+            dmin = int(self.spn_delay_min.value())
+            dmax = int(self.spn_delay_max.value())
+            # нормализуем порядок
+            if dmax < dmin:
+                dmin, dmax = dmax, dmin
+            # парсим список прокси
+            raw = self.txt_proxies.toPlainText().splitlines()
+            proxies = [line.strip() for line in raw if line.strip()]
+            set_avatar = bool(self.chk_set_avatar.isChecked())
+            threads = int(self.spn_threads.value())
+            ppt = int(self.spn_ppt.value())
+            return cnt, proxies, dmin, dmax, set_avatar, threads, ppt
+        except Exception:
+            return 0, [], 0, 0, True, 1, 0
 
 class UpdateDownloadThread(QThread):
     progress = pyqtSignal(int)
@@ -1238,6 +2335,9 @@ class PPPokerTab(QWidget):
         except Exception:
             pass
 
+    def on_generate_accounts(self):
+        QMessageBox.information(self, "Недоступно", "Генерация аккаунтов недоступна на этой вкладке.")
+
     def on_stop(self):
         if self.worker.isRunning():
             self.worker.stop(); self.log.appendPlainText(f"{Icons.WARNING} 🛑 Запрос на остановку отправлен...")
@@ -1266,6 +2366,19 @@ class PPPokerTab(QWidget):
             }
         except Exception:
             pass
+
+    def on_new_account(self, acc: Account):
+        # Добавляем аккаунт в таблицу
+        self.accounts.append(acc)
+        self._append_account_row(acc)
+        self.worker.accounts = self.accounts
+        try:
+            self.account_row_by_username[acc.username.lower()] = len(self.accounts)-1
+        except Exception:
+            pass
+        self.log.appendPlainText(f"{Icons.SUCCESS} Добавлен зарегистрированный аккаунт: {acc.username}")
+        # Автосохранение настроек
+        self.save_settings()
 
     def on_export_report(self):
         if not self.report_rows:
@@ -1389,12 +2502,14 @@ class MainWindow(QMainWindow):
         self.btn_delete_account = QPushButton("🗑️ Удалить")
         self.btn_load_accounts = QPushButton("📁 Из Excel файла")
         self.btn_save_accounts = QPushButton("💾 Сохранить настройки")
+        self.btn_generate_accounts = QPushButton("🧪 Сгенерировать аккаунты")
         
         accounts_layout.addWidget(self.btn_add_account)
         accounts_layout.addWidget(self.btn_edit_account)
         accounts_layout.addWidget(self.btn_delete_account)
         accounts_layout.addWidget(self.btn_load_accounts)
         accounts_layout.addWidget(self.btn_save_accounts)
+        accounts_layout.addWidget(self.btn_generate_accounts)
         accounts_layout.addStretch()
         v.addWidget(accounts_group)
         
@@ -1496,6 +2611,7 @@ class MainWindow(QMainWindow):
         self.btn_delete_account.clicked.connect(self.on_delete_account)
         self.btn_load_accounts.clicked.connect(self.on_load_accounts)
         self.btn_save_accounts.clicked.connect(self.on_save_accounts)
+        self.btn_generate_accounts.clicked.connect(self.on_generate_accounts)
         
         self.btn_add_clubs.clicked.connect(self.on_add_clubs)
         self.btn_clear_clubs.clicked.connect(self.on_clear_clubs)
@@ -1526,6 +2642,11 @@ class MainWindow(QMainWindow):
         # Отображение прогресса по аккаунтам
         self.account_row_by_username: Dict[str, int] = {}
         self.worker.account_progress.connect(self.on_account_progress)
+        # Новый аккаунт из генератора/регистрации
+        try:
+            self.worker.new_account.connect(self.on_new_account)
+        except Exception:
+            pass
         
         # Базовый стиль системы для режима "Системная"
         try:
@@ -1715,6 +2836,49 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Ошибка загрузки", f"Не удалось загрузить файл распределения:\n{str(e)}")
             self.log.appendPlainText(f"{Icons.ERROR} Ошибка загрузки распределения: {e}")
+
+    def on_generate_accounts(self):
+        # Диалог: количество + список прокси + задержки + опция аватара
+        default_proxies_text = getattr(self, 'reg_proxies_last', '')
+        dmin = getattr(self, 'reg_delay_min_last', 400)
+        dmax = getattr(self, 'reg_delay_max_last', 900)
+        def_set_avatar = getattr(self, 'reg_set_avatar_last', True)
+        def_threads = getattr(self, 'reg_threads_last', 1)
+        def_ppt = getattr(self, 'reg_ppt_last', 0)
+        dlg = GenerateAccountsDialog(default_count=100, default_proxies_text=default_proxies_text, default_dmin=dmin, default_dmax=dmax, default_set_avatar=def_set_avatar, default_threads=def_threads, default_ppt=def_ppt, parent=self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        cnt, proxies_list, delay_min_ms, delay_max_ms, set_avatar, threads, ppt = dlg.get_values()
+        if cnt <= 0:
+            return
+        if self.worker.isRunning():
+            QMessageBox.information(self, "Занято", "Процесс уже выполняется"); return
+        # Сохраняем последние параметры
+        self.reg_proxies_last = "\n".join(proxies_list)
+        self.reg_delay_min_last = int(delay_min_ms)
+        self.reg_delay_max_last = int(delay_max_ms)
+        self.reg_set_avatar_last = bool(set_avatar)
+        self.reg_threads_last = int(max(1, threads))
+        self.reg_ppt_last = int(max(0, ppt))
+        self.save_settings()
+        # Запускаем задачу регистрации (параллельно если threads>1)
+        if int(threads) > 1:
+            self.worker.set_task(self.worker.task_register_accounts_parallel, cnt, True, bool(set_avatar), 'files/words.txt', None, delay_min_ms, delay_max_ms, proxies_list, int(threads), int(ppt))
+        else:
+            self.worker.set_task(self.worker.task_register_accounts, cnt, True, bool(set_avatar), 'files/words.txt', None, delay_min_ms, delay_max_ms, proxies_list)
+        self.worker.start()
+
+    def on_new_account(self, acc: Account):
+        """Обработчик добавления нового аккаунта (после успешной регистрации)."""
+        try:
+            self.accounts.append(acc)
+            self._append_account_row(acc)
+            self.account_row_by_username[acc.username.lower()] = len(self.accounts) - 1
+            self.worker.accounts = self.accounts
+            self.log.appendPlainText(f"{Icons.SUCCESS} Добавлен зарегистрированный аккаунт: {acc.username}")
+            self.save_settings()
+        except Exception as e:
+            self.log.appendPlainText(f"{Icons.ERROR} Не удалось добавить аккаунт в таблицу: {e}")
 
     def on_login_all(self):
         if not self.accounts:
@@ -2291,13 +3455,19 @@ class MainWindow(QMainWindow):
                 'refresh_token_expire': acc.refresh_token_expire,
             } for acc in self.accounts],
             'club_ids': self.club_ids,
-'settings': {
+            'settings': {
                 'clubs_per_account': self.spn_clubs_per_account.value(),
                 'delay_min_ms': self.spn_delay_min.value(),
                 'delay_max_ms': self.spn_delay_max.value(),
                 'shuffle_clubs': self.chk_shuffle.isChecked(),
                 'apply_message': self.txt_message.text(),
                 'theme': getattr(self, 'theme_pref', 'system'),
+                'reg_proxies': getattr(self, 'reg_proxies_last', ''),
+                'reg_delay_min_ms': int(getattr(self, 'reg_delay_min_last', 400)),
+                'reg_delay_max_ms': int(getattr(self, 'reg_delay_max_last', 900)),
+                'reg_set_avatar': bool(getattr(self, 'reg_set_avatar_last', True)),
+                'reg_threads': int(getattr(self, 'reg_threads_last', 1)),
+                'reg_proxies_per_thread': int(getattr(self, 'reg_ppt_last', 0)),
             }
         }
         try:
@@ -2371,6 +3541,13 @@ class MainWindow(QMainWindow):
             self.txt_message.setText(ui_settings.get('apply_message', ''))
             # Тема (установить выбор и применить)
             theme_mode = ui_settings.get('theme', 'system')
+            # Последние параметры генерации
+            self.reg_proxies_last = ui_settings.get('reg_proxies','') or ui_settings.get('reg_proxy','') or ''
+            self.reg_delay_min_last = int(ui_settings.get('reg_delay_min_ms', 400))
+            self.reg_delay_max_last = int(ui_settings.get('reg_delay_max_ms', 900))
+            self.reg_set_avatar_last = bool(ui_settings.get('reg_set_avatar', True))
+            self.reg_threads_last = int(ui_settings.get('reg_threads', 1))
+            self.reg_ppt_last = int(ui_settings.get('reg_proxies_per_thread', 0))
             # Установить выбор в комбобоксе
             try:
                 idx = next(i for i in range(self.cmb_theme.count()) if self.cmb_theme.itemData(i) == theme_mode)

@@ -5,7 +5,9 @@ import time
 import json
 import hashlib
 import logging
+import os
 from typing import Optional, Dict, Any, Tuple
+from pathlib import Path
 
 import requests
 import urllib3
@@ -16,7 +18,7 @@ import ssl
 from .proxy_utils import normalize_proxy_input
 
 from .constants import (
-    DEFAULT_BASE_URL, LOGIN_PATH, LOGOUT_PATH,
+    DEFAULT_BASE_URL, LOGIN_PATH, REGISTER_PATH, LOGOUT_PATH,
     JOIN_CLUB_PATH, SEARCH_CLUB_PATH, REFRESH_PATH,
     DEFAULT_HEARTBEAT_INTERVAL, XPOKER_CLIENT_VERSION,
 )
@@ -26,6 +28,30 @@ from .messages import Icons, decode_club_apply_status, format_tcp_step
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 log = logging.getLogger(__name__)
+
+# Dedicated HTTP trace logger -> logs/http_requests.log
+_httptrace: Optional[logging.Logger] = None
+
+def _get_httptrace() -> logging.Logger:
+    global _httptrace
+    if _httptrace is not None:
+        return _httptrace
+    logger = logging.getLogger('httptrace')
+    if not getattr(logger, '_configured', False):
+        try:
+            trace_path = Path('logs')/ 'http_requests.log'
+            trace_path.parent.mkdir(parents=True, exist_ok=True)
+            fh = logging.FileHandler(str(trace_path), encoding='utf-8')
+            fmt = logging.Formatter('%(asctime)s %(levelname)s %(message)s')
+            fh.setFormatter(fmt)
+            logger.addHandler(fh)
+            logger.setLevel(logging.INFO)
+            # Mark configured to avoid duplicates even across multiple API instances
+            setattr(logger, '_configured', True)
+        except Exception:
+            pass
+    _httptrace = logger
+    return logger
 
 # HTTP keys from Lua dump
 HTTP_KEY_PROD = "aacadfb9b150ff8fa713bbe8431773fa"
@@ -163,14 +189,25 @@ class XPokerAPI:
             headers: Optional additional headers
             timeout: Request timeout in seconds"""
         self.base_url = base_url.rstrip("/")
+        # Disable TLS key logging if set in environment to avoid file handle leaks on massive handshakes
+        try:
+            if os.environ.get('SSLKEYLOGFILE'):
+                os.environ.pop('SSLKEYLOGFILE', None)
+                log.info("SSLKEYLOGFILE detected in environment — disabled for this process to prevent open-file exhaustion")
+        except Exception:
+            pass
         self.session = requests.Session()
         
         # Configure retry strategy
         retry_strategy = Retry(
-            total=3,
-            backoff_factor=1,
+            total=2,
+            connect=2,
+            read=2,
+            status=2,
+            backoff_factor=3,
             status_forcelist=[429, 500, 502, 503, 504],
-            allowed_methods=["HEAD", "GET", "OPTIONS", "POST"]
+            allowed_methods=["HEAD", "GET", "OPTIONS", "POST"],
+            respect_retry_after_header=True
         )
         
         # Mount TLS adapter with retry strategy
@@ -178,12 +215,29 @@ class XPokerAPI:
         self.session.mount("https://", adapter)
         self.session.mount("http://", adapter)
         
+        # Store retry policy for logging/user messages
+        self._retry_total = 2
+        self._retry_backoff = 3
+        log.info(f"HTTP повторы настроены: попыток={self._retry_total}, backoff≈{self._retry_backoff}s")
+        
         self.session.headers.update(default_headers())
         if headers:
             self.session.headers.update(headers)
         self.proxies = to_requests_proxies(proxy)
         self.proxy_url: Optional[str] = proxy  # сохраняем исходную строку для TCP
         self.timeout = timeout
+        # Trace initial settings
+        try:
+            httptrace = _get_httptrace()
+            masked = None
+            if self.proxies:
+                try:
+                    masked = {k: mask_proxy_for_log(v) for k, v in self.proxies.items()}
+                except Exception:
+                    masked = {"http": "***", "https": "***"}
+            httptrace.info(f"INIT base_url={self.base_url} proxy={masked if masked else 'None'} retries={getattr(self,'_retry_total', '2')} backoff≈{getattr(self,'_retry_backoff','30')}s")
+        except Exception:
+            pass
         self.token: Optional[str] = None
         self.refresh_token: Optional[str] = None
         self.access_token_expire: Optional[int] = None
@@ -239,6 +293,29 @@ class XPokerAPI:
             log.debug(f"   🔀 Proxy: {masked}")
             
         start_time = time.time()
+        # HTTP trace: request line (safe)
+        try:
+            httptrace = _get_httptrace()
+            masked = None
+            if self.proxies:
+                try:
+                    masked = {k: mask_proxy_for_log(v) for k, v in self.proxies.items()}
+                except Exception:
+                    masked = {"http": "***", "https": "***"}
+            body_info = None
+            if isinstance(json_body, dict):
+                try:
+                    body_info = f"keys={list(json_body.keys())}"
+                except Exception:
+                    body_info = "dict"
+            elif json_body is not None:
+                try:
+                    body_info = f"type={type(json_body).__name__}"
+                except Exception:
+                    body_info = "payload"
+            httptrace.info(f"REQ {method} {url} params={params} body={body_info} proxy={masked if masked else 'None'}")
+        except Exception:
+            pass
         try:
             r = self.session.request(
                 method, url,
@@ -256,6 +333,22 @@ class XPokerAPI:
         except requests.exceptions.ConnectTimeout as e:
             log.error(f"❌ Таймаут соединения при обращении к {url}: {e}")
             raise ApiError(f"Connect timeout: {e}")
+        except requests.exceptions.RetryError as e:
+            # Повторные 5xx/429 исчерпали лимит ретраев — считаем как API-ошибку для ротации прокси
+            log.error(f"❌ HTTP повторы исчерпаны для {url}: {e} (политика: попыток={getattr(self,'_retry_total', 'N/A')}, backoff≈{getattr(self,'_retry_backoff','N/A')}s)")
+            try:
+                _get_httptrace().error(f"ERR {method} {url} -> RETRY-EXHAUSTED: {e}")
+            except Exception:
+                pass
+            raise ApiError(f"Retry error: {e}")
+        except urllib3.exceptions.MaxRetryError as e:
+            # На всякий случай, если пробросится низкоуровневая ошибка urllib3
+            log.error(f"❌ HTTP max retries for {url}: {e} (политика: попыток={getattr(self,'_retry_total', 'N/A')}, backoff≈{getattr(self,'_retry_backoff','N/A')}s)")
+            try:
+                _get_httptrace().error(f"ERR {method} {url} -> MAX-RETRIES: {e}")
+            except Exception:
+                pass
+            raise ApiError(f"Retry error: {e}")
         except requests.exceptions.ConnectionError as e:
             # Если прокси задан, поясним, что проблема на стороне прокси
             if self.proxies:
@@ -269,6 +362,11 @@ class XPokerAPI:
         
         # Compact response line
         log.info(f"HTTP {method} {path} -> {r.status_code} ({request_time:.3f}s)")
+        try:
+            httptrace = _get_httptrace()
+            httptrace.info(f"RSP {method} {url} -> {r.status_code} in {request_time:.3f}s len={len(r.content) if hasattr(r,'content') else 'N/A'}")
+        except Exception:
+            pass
         # Verbose details to DEBUG
         log.debug(f"   📥 Response headers: {dict(r.headers)}")
         response_text = r.text
@@ -302,6 +400,11 @@ class XPokerAPI:
         
         if r.status_code >= 400:
             log.error(f"❌ HTTP Error {r.status_code}: {r.text}")
+            try:
+                httptrace = _get_httptrace()
+                httptrace.error(f"ERR {method} {url} -> {r.status_code} body={r.text[:400]}...")
+            except Exception:
+                pass
             raise ApiError(f"{r.status_code} {r.text}")
             
         try:
@@ -438,6 +541,77 @@ class XPokerAPI:
         except Exception as e:
             log.debug(f"Failed to capture TCP entry from login: {e}")
             
+        return data
+
+    def register(
+        self,
+        *,
+        username: str,
+        password: str,
+        device_id: str,
+        os_code: str = "3",
+        device: str = "windows",
+        lang: str = "ru",
+        app_level: int = 0,
+        timezone_id: str = "",
+        device_token: str = "",
+        country: str = "UnKnown",
+    ) -> Dict[str, Any]:
+        """Register a new X-Poker account and try to capture tokens/TCP entry.
+
+        The registration payload mirrors login fields and uses the same double MD5
+        password scheme and timestamp/sign generation.
+        """
+        payload = {
+            "timezoneId": timezone_id,
+            "appLevel": app_level,
+            "os": os_code,
+            "device": device,
+            "deviceId": device_id,
+            "lang": lang,
+            "username": username,
+            "password": double_md5(password),
+            "deviceToken": device_token,
+            "country": country,
+        }
+        # keep last device_id for potential refresh
+        self.device_id = device_id
+        ts = int(time.time())
+        sign = generate_sign(payload, ts, REGISTER_PATH)
+        params = {"timestamp": str(ts), "sign": sign}
+        log.debug(f"Registration attempt for {username}")
+        data = self._request("POST", REGISTER_PATH, params=params, json_body=payload, auth_token=None)
+        # Try to extract token/refresh/entry similar to login
+        try:
+            if isinstance(data, dict) and data.get("code") == 0:
+                # token container can be in data.auth or at top-level
+                auth = data.get("data", {}).get("auth", data.get("data", {}))
+                tok = auth.get("accessToken") or data.get("accessToken") or data.get("token")
+                if tok:
+                    self.token = tok
+                    self.refresh_token = auth.get("refreshToken") or self.refresh_token
+                    self.access_token_expire = auth.get("accessTokenExpire") or self.access_token_expire
+                    self.refresh_token_expire = auth.get("refreshTokenExpire") or self.refresh_token_expire
+                # TCP entry
+                entry = data.get("data", {}).get("entry", {})
+                eps: list[tuple[str,int]] = []
+                for k_host, k_port in (("gameBaseEntry","gameBasePort"),("gameBaseEntry2","gameBasePort2"),("gameBaseEntry3","gameBasePort3")):
+                    try:
+                        h = entry.get(k_host); p = entry.get(k_port)
+                        if h:
+                            eps.append((str(h), int(p or 5000)))
+                    except Exception:
+                        pass
+                dedup: list[tuple[str,int]] = []
+                for hp in eps:
+                    if hp not in dedup:
+                        dedup.append(hp)
+                if dedup:
+                    self.tcp_entries = dedup
+                    self.tcp_host, self.tcp_port = dedup[0]
+                    log.info(f"🧭 TCP entry from register: {self.tcp_host}:{self.tcp_port}")
+        except Exception as e:
+            log.debug(f"register(): post-parse failed: {e}")
         return data
 
     def logout(self, auth_token: Optional[str] = None, uid: Optional[int] = None, device_id: Optional[str] = None, app_level: int = 0) -> Dict[str, Any]:

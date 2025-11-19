@@ -11,6 +11,7 @@ XPOKER_CLIENT_VERSION = "1.12.68"
 # HTTP API endpoints
 DEFAULT_BASE_URL = "https://api.x-poker.net"
 LOGIN_PATH = "/api/auth/login"
+REGISTER_PATH = "/api/auth/register"
 LOGOUT_PATH = "/api/token/logout"
 REFRESH_PATH = "/api/token/refresh"  # предположительно; при ошибке используем повторный login
 JOIN_CLUB_PATH = "/api/club/join"
@@ -127,6 +128,10 @@ MSG_TYPE_IDS = {
     "FetchNewUserNDayRewardREQ": 0x001c,
     "FetchNewUserNDayRewardRSP": 0x001c,
 
+    # Profile
+    "ChangeNameREQ": 0x0010,
+    "ChangeNameRSP": 0x0010,
+
     # Appearance / items / email
     "GetAppearanceSystemDataREQ": 0x001d,
     "GetAppearanceSystemDataRSP": 0x001d,
@@ -137,20 +142,30 @@ MSG_TYPE_IDS = {
     "GetEMailListREQ": 0x0012,
     "GetEMailListRSP": 0x0012,
 
-    # Waiting list
-    "GetWaitingListDetailREQ": 0x001a,
-    "GetWaitingListDetailRSP": 0x001a,
-
-    # Search
-    "SearchClubREQ": 0x0012,
-
-    # Logout
-    "UserLogoutREQ": 0x0010,
-    "UserLogoutRSP": 0x0010,
-}
+    # Avatar change (по PCAP дампу видно, что использует тот же тип 0x0012)
+    "ChangeAvatarREQ": 0x0012,
+    "ChangeAvatarRSP": 0x0012,
+ 
+     # Waiting list
+     "GetWaitingListDetailREQ": 0x001a,
+     "GetWaitingListDetailRSP": 0x001a,
+ 
+     # Search
+     "SearchClubREQ": 0x0012,
+ 
+     # Logout
+     "UserLogoutREQ": 0x0010,
+     "UserLogoutRSP": 0x0010,
+ }
 
 # Heartbeat configuration
 DEFAULT_HEARTBEAT_INTERVAL = 3.0  # seconds (согласно TCP инструкции)
 
 # Frame size limits
 MAX_FRAME_SIZE = 1024 * 1024  # 1MB
+
+# Default avatar URLs for ChangeAvatarREQ (получены из мобильного дампа)
+# Можно менять/расширять вручную по мере необходимости.
+DEFAULT_AVATAR_URLS = [
+    "https://static-eu1.x-game.net/user/avatar/3717943_1763465153.jpg",
+]
