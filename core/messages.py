@@ -94,9 +94,18 @@ def format_join_result(username: str, club_id: str, success: bool, message: str)
     if not success and ("cancel" in low or "отмен" in low):
         return f"{Icons.WARNING} [{username}] → Клуб {club_id}: Отменено"
     if success:
-        return f"{Icons.SUCCESS} [{username}] → Клуб {club_id}: Клуб есть"
+        # Уточняем формулировку для успешной заявки
+        if any(s in low for s in ("already", "уже в клубе", "уже состоит")):
+            text = "Клуб есть (уже в клубе)"
+        else:
+            text = "Клуб есть, заявка отправлена"
+        return f"{Icons.SUCCESS} [{username}] → Клуб {club_id}: {text}"
     # Явные маркеры отсутствия клуба
-    not_found_markers = ("не существует", "клуб не найден", "club not found")
+    not_found_markers = (
+        "клуба нет", "нет клуба",  # явные русские формулировки
+        "не существует", "клуб не найден",  # прежние русские
+        "club not found", "no club", "not exists"
+    )
     if any(p in low for p in not_found_markers):
         return f"{Icons.ERROR} [{username}] → Клуб {club_id}: Клуба нет"
     # Иначе — заявка не отправлена (причину показываем, если есть)

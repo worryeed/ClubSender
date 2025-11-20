@@ -107,8 +107,17 @@ class PPPokerAPI:
         self.tcp_entries: List[tuple[str, int]] = []
         self.tcp_host: Optional[str] = None
         self.tcp_port: Optional[int] = None
+        # server-provided client version (fallback to constant)
+        self.client_version: str = CLIENT_VER
+        self._version_fetched: bool = False
 
     def login(self, *, username: str, password: str, device_id: str = "", **kwargs) -> Dict[str, Any]:
+        # Try to refresh client version once per instance
+        try:
+            if not self._version_fetched:
+                self.fetch_server_version()
+        except Exception:
+            pass
         url = BASE_URL + LOGIN_PATH
         crypto_pw = compute_crypto_password(password)
         t_epoch = int(time.time())
@@ -122,8 +131,8 @@ class PPPokerAPI:
             'os': 'windows',
             'distributor': '0', 'sub_distributor': '0',
             'country': 'RU',
-            'appid': 'globle', 'clientvar': CLIENT_VER,
-'imei': _normalize_imei(device_id, username),
+            'appid': 'globle', 'clientvar': self.client_version,
+            'imei': _normalize_imei(device_id, username),
             'device_token': '', 'platform_type': '1',
             'lang': 'ru', 'languagecode': 'ru',
             'apple_full_name': '', 'apple_user': '', 'apple_identity_token': '',
@@ -146,6 +155,48 @@ class PPPokerAPI:
             except Exception:
                 pass
         return j
+
+    def fetch_server_version(self) -> None:
+        """Attempt to fetch latest client version from known endpoints.
+        Non-fatal: on failure keeps existing self.client_version.
+        """
+        endpoints = [
+            BASE_URL + "/poker/api/version.php",
+            BASE_URL + "/poker/api/getversion.php",
+            BASE_URL + "/poker/api/getVersion.php",
+            BASE_URL + "/poker/api/version.json",
+        ]
+        for url in endpoints:
+            try:
+                r = self.session.get(url, proxies=self.proxies, timeout=min(8, self.timeout))
+                if r.status_code != 200:
+                    continue
+                try:
+                    j = r.json()
+                except Exception:
+                    j = None
+                ver = None
+                if isinstance(j, dict):
+                    # common keys observed across builds
+                    for k in ("clientvarwin", "clientvar", "pc", "win", "version", "clientVersion"):
+                        if k in j and j[k]:
+                            cand = str(j[k]).strip()
+                            if cand:
+                                ver = cand
+                                break
+                if not ver:
+                    # try to parse plain text
+                    import re
+                    m = re.search(r"\b(\d+\.\d+(?:\.\d+){0,2})\b", r.text)
+                    if m:
+                        ver = m.group(1)
+                if ver:
+                    self.client_version = ver
+                    self._version_fetched = True
+                    return
+            except Exception:
+                continue
+        self._version_fetched = True
 
     def logout(self, *args, **kwargs) -> Dict[str, Any]:
         # PPPoker login flow does not require explicit logout for our purposes
@@ -181,6 +232,11 @@ class PPPokerAPI:
         port = int(self.tcp_port or 4000)
         clientip = ''  # optional; could fetch via /version.php if needed
         tcp = PPPokerTCPClient(host=host, port=port, timeout=5.0, proxy=self.proxy_url)
+        # Set server-provided client version if available
+        try:
+            tcp.clientver = self.client_version or CLIENT_VER
+        except Exception:
+            pass
         results: list[Tuple[int, bool, str]] = []
         try:
             # Жёсткая отмена: при установке cancel_event закрыть сокет (разблокирует ожидания)
@@ -214,7 +270,20 @@ class PPPokerAPI:
                         break
                 except Exception:
                     pass
-                # remark: cap to 40 chars similar to XPoker UI
+                # 1) Префлайт: существование клуба через ClubBriefInfo
+                try:
+                    exists, info = tcp.get_club_brief_info(club_id=int(cid))
+                except Exception:
+                    exists, info = False, {"error": "brief_info_failed"}
+                if not exists:
+                    results.append((cid, False, "Клуба нет"))
+                    try:
+                        if result_cb:
+                            result_cb(cid, False, "Клуба нет", idx, total)
+                    except Exception:
+                        pass
+                    continue
+                # 2) Join только если клуб существует
                 remark = (message_text or f"pp{uid}")
                 if len(remark) > 40:
                     remark = remark[:40]

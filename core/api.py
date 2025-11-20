@@ -15,6 +15,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.ssl_ import create_urllib3_context
 from requests.packages.urllib3.util.retry import Retry
 import ssl
+import socket
 from .proxy_utils import normalize_proxy_input
 
 from .constants import (
@@ -197,6 +198,9 @@ class XPokerAPI:
         except Exception:
             pass
         self.session = requests.Session()
+        
+        # Server-provided client version (used for TCP); fallback to constant
+        self.client_version: str = XPOKER_CLIENT_VERSION
         
         # Configure retry strategy
         retry_strategy = Retry(
@@ -494,6 +498,11 @@ class XPokerAPI:
                             data_field.get("access_token") or
                             data_field.get("accessToken")
                         )
+            # Try to detect client version from response
+            try:
+                self._maybe_update_client_version_from_response(data)
+            except Exception:
+                pass
         
         if token:
             self.token = token
@@ -592,6 +601,11 @@ class XPokerAPI:
                     self.refresh_token = auth.get("refreshToken") or self.refresh_token
                     self.access_token_expire = auth.get("accessTokenExpire") or self.access_token_expire
                     self.refresh_token_expire = auth.get("refreshTokenExpire") or self.refresh_token_expire
+                # Best-effort: detect client version from response
+                try:
+                    self._maybe_update_client_version_from_response(data)
+                except Exception:
+                    pass
                 # TCP entry
                 entry = data.get("data", {}).get("entry", {})
                 eps: list[tuple[str,int]] = []
@@ -778,9 +792,9 @@ class XPokerAPI:
         fallback_eps: list[tuple[str, int]] = []
         if host and port:
             log.info(f"🧭 Используем сервер из HTTP-логина: {host}:{port}")
-            tcp_client = XClubTCPClient(host=host, port=port, timeout=2.0, proxy=self.proxy_url, fallback_endpoints=fallback_eps, disable_bootstrap=True, frida_strict=True, log_tx_hex=False, log_rx_hex=False)
+            tcp_client = XClubTCPClient(host=host, port=port, timeout=4.5, proxy=self.proxy_url, fallback_endpoints=fallback_eps, disable_bootstrap=True, frida_strict=True, log_tx_hex=False, log_rx_hex=False)
         else:
-            tcp_client = XClubTCPClient(timeout=2.0, proxy=self.proxy_url, fallback_endpoints=fallback_eps, disable_bootstrap=True, frida_strict=True, log_tx_hex=False, log_rx_hex=False)
+            tcp_client = XClubTCPClient(timeout=4.5, proxy=self.proxy_url, fallback_endpoints=fallback_eps, disable_bootstrap=True, frida_strict=True, log_tx_hex=False, log_rx_hex=False)
         # Пробрасываем событие отмены внутрь TCP клиента (если есть)
         try:
             if cancel_event is not None and hasattr(tcp_client, 'set_cancel_event'):
@@ -806,11 +820,21 @@ class XPokerAPI:
         try:
             # Подключение и TCP-логин
             log.info(f"{Icons.TCP} Открываем одно TCP соединение для {len(club_ids)} клубов...")
-            tcp_client.connect()
+            try:
+                tcp_client.connect()
+            except socket.timeout as e:
+                raise ApiError(f"tcp_connect: timed out ({e})")
+            except Exception as e:
+                raise ApiError(f"tcp_connect: {e}")
             log.info(format_tcp_step("TCP соединение установлено", True))
             log.info(f"{Icons.AUTH} TCP авторизация...")
             start_time = time.time()
-            login_response = tcp_client.tcp_login(uid, token, version=XPOKER_CLIENT_VERSION)
+            try:
+                login_response = tcp_client.tcp_login(uid, token, version=getattr(self, 'client_version', XPOKER_CLIENT_VERSION))
+            except socket.timeout as e:
+                raise ApiError(f"tcp_login: timed out ({e})")
+            except Exception as e:
+                raise ApiError(f"tcp_login: {e}")
             login_time = time.time() - start_time
             if b"pk.UserLoginRSP" in login_response:
                 log.info(format_tcp_step(f"TCP авторизация успешна ({login_time:.3f}с)", True, f"размер ответа: {len(login_response)} байт"))
@@ -825,6 +849,8 @@ class XPokerAPI:
                     ok, msg = self.refresh_access_token()
                     if ok and self.token:
                         tcp_client.close()
+                        # Малый интервал перед повторным подключением для стабильности
+                        time.sleep(0.5)
                         tcp_client.connect()
                         login_response = tcp_client.tcp_login(uid, self.token)
                 if b"pk.UserLoginRSP" not in (login_response or b""):
@@ -870,6 +896,50 @@ class XPokerAPI:
                     tcp_client.close()
                 except Exception:
                     pass
+
+    def _maybe_update_client_version_from_response(self, data: Dict[str, Any]) -> None:
+        """Scan response dict for a version-like value and update self.client_version and User-Agent.
+        Non-fatal; updates only if a plausible version like '1.12.70' is found.
+        """
+        import re
+        ver = None
+        def _scan(obj: Any):
+            nonlocal ver
+            if ver is not None:
+                return
+            if isinstance(obj, dict):
+                for k, v in obj.items():
+                    key = str(k).lower()
+                    if any(s in key for s in ("clientver", "clientversion", "version", "appversion")):
+                        try:
+                            sv = str(v)
+                        except Exception:
+                            sv = None
+                        if sv:
+                            m = re.search(r"\b(\d+\.\d+(?:\.\d+){0,2})\b", sv)
+                            if m:
+                                ver = m.group(1)
+                                return
+                    _scan(v)
+            elif isinstance(obj, list):
+                for it in obj:
+                    _scan(it)
+        _scan(data)
+        if ver:
+            try:
+                if ver != self.client_version:
+                    self.client_version = ver
+                    # Update User-Agent to match
+                    try:
+                        ua = self.session.headers.get("User-Agent", "")
+                        if ua.startswith("X-Poker/"):
+                            new_ua = f"X-Poker/{ver} (Windows)"
+                            self.session.headers["User-Agent"] = new_ua
+                    except Exception:
+                        pass
+                    log.info(f"Detected server client version: {ver}")
+            except Exception:
+                pass
 
     def refresh_access_token(self, refresh_token: Optional[str] = None) -> Tuple[bool, str]:
         """Attempt to refresh the access token using refresh_token.

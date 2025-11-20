@@ -1,6 +1,6 @@
 
 from __future__ import annotations
-import sys, os, time, traceback
+import sys, os, time, traceback, socket
 import logging
 from logging.handlers import RotatingFileHandler
 from typing import List, Optional, Dict, Set
@@ -15,6 +15,7 @@ from PyQt6.QtWidgets import (
 )
 import pandas as pd
 import json
+import requests
 from pathlib import Path
 import platform
 try:
@@ -234,8 +235,23 @@ class Worker(QThread):
                     except Exception:
                         acc.headers = {}
                     self.account_updated.emit(idx, acc.as_row())
-                    token_status = 'получен' if token else 'отсутствует'
-                    self.log.emit(format_login_step(acc.username, "Авторизация завершена", bool(token), f"токен {token_status}"))
+                    # Понятный вывод причины, если токен не получен
+                    human = None
+                    try:
+                        if isinstance(data, dict):
+                            dcode = int(data.get('code', -1))
+                            dmsg = str(data.get('msg', '') or '').lower()
+                            if not token:
+                                if dcode == 10010042 or 'user ban' in dmsg:
+                                    human = 'аккаунт забанен (10010042)'
+                                elif dcode == 10000044 or 'accessdenied' in dmsg or 'access denied' in dmsg:
+                                    human = 'IP под угрозой — использование запрещено (10000044)'
+                    except Exception:
+                        pass
+                    if token:
+                        self.log.emit(format_login_step(acc.username, "Авторизация завершена", True, "токен получен"))
+                    else:
+                        self.log.emit(format_login_step(acc.username, "Авторизация завершена", False, human or "токен отсутствует"))
                 except self.api_error_class as e:
                     self.log.emit(format_login_step(acc.username, "Ошибка API", False, str(e)))
                 except Exception as e:
@@ -255,11 +271,27 @@ class Worker(QThread):
             threads.append(t)
             t.start()
         # Ожидаем завершение всех групп или стоп
+        stop_deadline = 0.0
+        announced_wait = False
         while any(t.is_alive() for t in threads):
             if self._stop:
-                break
+                if not announced_wait:
+                    try:
+                        self.log.emit(f"{Icons.INFO} Ожидаем остановки рабочих потоков...")
+                    except Exception:
+                        pass
+                    announced_wait = True
+                    stop_deadline = time.time() + 6.0  # максимум 6с на корректное завершение
+                if time.time() > stop_deadline:
+                    break
             self._wait_if_paused()
-            time.sleep(0.2)
+            time.sleep(0.1)
+        # Точечно подождём каждый поток до 300мс, чтобы убрать хвосты логов
+        for t in threads:
+            try:
+                t.join(timeout=0.3)
+            except Exception:
+                pass
         self.task_finished.emit()
 
     def task_logout_selected(self, rows: List[int]):
@@ -394,7 +426,9 @@ class Worker(QThread):
                     return True
                 # Колбэк результатов по мере выполнения
                 def result_cb(cid: int, ok: bool, msg: str, idx: int, total: int):
-                    # done = idx + 1
+                    # Если запрошена остановка — не спамим логами и выходим как можно раньше
+                    if self._stop:
+                        return
                     done = idx + 1
                     self.join_result.emit(JoinResult(ts=time.time(), username=acc.username, club_id=str(cid), ok=ok, message=msg))
                     result_msg = format_join_result(acc.username, str(cid), ok, msg)
@@ -439,6 +473,9 @@ class Worker(QThread):
                     cancel_event=self._cancel_event,
                     message_text=message_text,
                 )
+                # Если остановка запрошена — не эмитим финальный статус для аккуратного молчаливого завершения
+                if self._stop:
+                    return
                 # Если result_cb уже отдал все, можно дополнительно финализировать статус
                 self.account_progress.emit(acc.username, len(results), len(club_ids_int), "🏁 Завершено", "-")
             except Exception as e:
@@ -450,12 +487,29 @@ class Worker(QThread):
             threads.append(t)
             t.start()
         
-        # Ожидаем завершения всех аккаунтов; при остановке не зависаем в ожидании — выходим сразу, TCP закроется по cancel_event
+        # Ожидаем завершения всех аккаунтов. При остановке даём короткое время потокам корректно завершиться.
+        stop_deadline = 0.0
+        announced_wait = False
         while any(t.is_alive() for t in threads):
             if self._stop:
-                break
+                if not announced_wait:
+                    try:
+                        self.log.emit(f"{Icons.INFO} Ожидаем остановки рабочих потоков...")
+                    except Exception:
+                        pass
+                    announced_wait = True
+                    stop_deadline = time.time() + 6.0  # максимум 6с на корректное завершение
+                # Если вышли за дедлайн — прекращаем ожидание
+                if time.time() > stop_deadline:
+                    break
             self._wait_if_paused()
-            time.sleep(0.2)
+            time.sleep(0.1)
+        # Дополнительно: точечно подождём каждый поток до 300мс, чтобы убрать хвосты логов
+        for t in threads:
+            try:
+                t.join(timeout=0.3)
+            except Exception:
+                pass
         
         # Итоговый отчёт по вступлению
         planned_clubs = min(total_clubs_needed, len(club_ids))
@@ -483,7 +537,45 @@ class Worker(QThread):
         a,b = self.jitter_ms
         return random.randint(a,b)/1000.0
 
-    def task_register_accounts(self, count: int, change_nick: bool = True, change_avatar: bool = True, words_file: Optional[str] = None, reg_proxy: Optional[str] = None, delay_min_ms: int = 400, delay_max_ms: int = 900, proxies: Optional[List[str]] = None):
+    # -------- helper: upload avatar to tmpfiles and return direct dl URL --------
+    def _upload_avatar_tmpfiles(self, file_path: str) -> Optional[str]:
+        try:
+            fn = os.path.basename(file_path)
+            with open(file_path, 'rb') as f:
+                files = {'file': (fn, f, 'application/octet-stream')}
+                r = requests.post('https://tmpfiles.org/api/v1/upload', files=files, timeout=25)
+            r.raise_for_status()
+            try:
+                j = r.json()
+            except Exception:
+                j = None
+            url = None
+            if isinstance(j, dict):
+                url = (j.get('data', {}) or {}).get('url') or j.get('url')
+            if not url:
+                txt = (r.text or '')
+                import re
+                m = re.search(r'https?://tmpfiles\.org/[^\s"]+', txt)
+                if m:
+                    url = m.group(0)
+            if not url:
+                return None
+            # Build direct dl URL
+            # Expected share url like https://tmpfiles.org/1234567/filename or /f/1234567/filename
+            import re
+            m = re.search(r'tmpfiles\.org/(?:f/)?(\d+)/(.*)$', url)
+            if m:
+                file_id, fname = m.group(1), m.group(2)
+                dl = f'https://tmpfiles.org/dl/{file_id}/{fname}'
+                return dl
+            # If already a direct link or unknown pattern
+            if '/dl/' in url:
+                return url
+            return url
+        except Exception:
+            return None
+
+    def task_register_accounts(self, count: int, change_nick: bool = True, change_avatar: bool = True, words_file: Optional[str] = None, reg_proxy: Optional[str] = None, delay_min_ms: int = 400, delay_max_ms: int = 900, proxies: Optional[List[str]] = None, avatar_path: Optional[str] = None):
         """Сгенерировать+зарегистрировать N аккаунтов, опционально сменить ник по TCP, добавить в таблицу.
         Работает последовательно. Задержка между шагами — случайная в заданном диапазоне.
         Поддержка списка прокси с ротацией при "жёстких" ошибках регистрации.
@@ -542,8 +634,9 @@ class Worker(QThread):
             # Known server/business codes
             if "code=20010029" in reason or "register ip limit" in r:
                 return "лимит регистраций по IP (20010029)"
-            if "code=10000044" in reason or "accessdenied" in r:
-                return "запрос отклонён (10000044)"
+            if "code=10000044" in reason or "accessdenied" in r or "access denied" in r:
+                # Сообщение, аналогичное всплывашке клиента
+                return "IP под угрозой — использование запрещено (10000044)"
             if "10010008" in reason or "username unavailable" in r:
                 return "имя занято (10010008)"
             # HTTP/transport patterns
@@ -602,6 +695,18 @@ class Worker(QThread):
         except Exception:
             regs_file = None
             regs_writer = None
+        # Подготовим общий URL аватара (однократная загрузка)
+        avatar_url_common: Optional[str] = None
+        if change_avatar and avatar_path:
+            try:
+                avatar_url_common = self._upload_avatar_tmpfiles(avatar_path)
+                if avatar_url_common:
+                    self.log.emit(f"{Icons.SUCCESS} Загружен аватар (tmpfiles): {avatar_url_common}")
+                else:
+                    self.log.emit(f"{Icons.WARNING} Не удалось загрузить аватар на tmpfiles — будет использован URL по умолчанию")
+            except Exception as e:
+                self.log.emit(f"{Icons.WARNING} Загрузка аватара не удалась: {e}")
+                avatar_url_common = None
         # Счётчики прогресса
         processed_total = 0
         success_total = 0
@@ -771,7 +876,9 @@ class Worker(QThread):
                 if code != 0:
                     fail_total += 1
                     processed_total += 1
-                    self.log.emit(f"{Icons.ERROR} Регистрация {username} отклонена: code={code} msg={msg}")
+                    # Более понятная причина вместо raw code/msg
+                    reason_h = _classify_reason(f"code={code} {msg}")
+                    self.log.emit(f"{Icons.ERROR} Регистрация {username} отклонена: {reason_h}")
                     time.sleep(self._rand_delay())
                     continue
                 # Пытаемся извлечь uid и токен
@@ -804,12 +911,15 @@ class Worker(QThread):
                     # URL аватарки (если требуется)
                     avatar_url = None
                     if change_avatar:
-                        try:
-                            avatar_url = DEFAULT_AVATAR_URLS[0] if DEFAULT_AVATAR_URLS else None
-                        except Exception:
-                            avatar_url = None
+                        if avatar_url_common:
+                            avatar_url = avatar_url_common
+                        else:
+                            try:
+                                avatar_url = DEFAULT_AVATAR_URLS[0] if DEFAULT_AVATAR_URLS else None
+                            except Exception:
+                                avatar_url = None
                         if not avatar_url:
-                            self.log.emit(f"{Icons.INFO} Смена аватара [{username}]: пропущено (нет URL по умолчанию)")
+                            self.log.emit(f"{Icons.INFO} Смена аватара [{username}]: пропущено (нет URL)")
                     # Ретраи TCP: до 3 попыток, с ротацией endpoint'ов
                     max_attempts = max(1, min(3, 1 + len(endpoints)))
                     ok_name = (not change_nick)
@@ -822,7 +932,7 @@ class Worker(QThread):
                         tcp = None
                         try:
                             self.log.emit(f"{Icons.PROCESS} TCP попытка {attempt_n}/{max_attempts} для [{username}] через {ehost}:{eport}")
-                            tcp = XClubTCPClient(host=ehost, port=eport, timeout=3.5, proxy=api.proxy_url, disable_bootstrap=True, frida_strict=True, fallback_endpoints=fallbacks)
+                            tcp = XClubTCPClient(host=ehost, port=eport, timeout=4.5, proxy=api.proxy_url, disable_bootstrap=True, frida_strict=True, fallback_endpoints=fallbacks)
                             try:
                                 tcp.set_cancel_event(self._cancel_event)
                             except Exception:
@@ -831,14 +941,38 @@ class Worker(QThread):
                                 self._live_tcps.add(tcp)
                             except Exception:
                                 pass
-                            tcp.connect()
-                            _ = tcp.tcp_login(uid=int(uid), token=api.token)
+                            # connect
+                            try:
+                                tcp.connect()
+                            except socket.timeout as e:
+                                raise RuntimeError(f"tcp_connect: timed out ({e})")
+                            except Exception as e:
+                                raise RuntimeError(f"tcp_connect: {e}")
+                            # login
+                            try:
+                                _ = tcp.tcp_login(uid=int(uid), token=api.token)
+                            except socket.timeout as e:
+                                raise RuntimeError(f"tcp_login: timed out ({e})")
+                            except Exception as e:
+                                raise RuntimeError(f"tcp_login: {e}")
+                            # change name
                             if change_nick and not ok_name:
-                                ok, cmsg = tcp.change_name(nick)
+                                try:
+                                    ok, cmsg = tcp.change_name(nick)
+                                except socket.timeout as e:
+                                    ok, cmsg = False, f"tcp_change_name: timed out ({e})"
+                                except Exception as e:
+                                    ok, cmsg = False, f"tcp_change_name: {e}"
                                 self.log.emit(f"{Icons.INFO} Смена ника [{username}] → '{nick}': {'успех' if ok else cmsg}")
                                 ok_name = ok or ok_name
+                            # change avatar
                             if change_avatar and avatar_url and not ok_av:
-                                ok_av1, msg_av = tcp.change_avatar(avatar_url)
+                                try:
+                                    ok_av1, msg_av = tcp.change_avatar(avatar_url)
+                                except socket.timeout as e:
+                                    ok_av1, msg_av = False, f"tcp_change_avatar: timed out ({e})"
+                                except Exception as e:
+                                    ok_av1, msg_av = False, f"tcp_change_avatar: {e}"
                                 self.log.emit(f"{Icons.INFO} Смена аватара [{username}] → '{avatar_url}': {'успех' if ok_av1 else msg_av}")
                                 ok_av = ok_av1 or ok_av
                             if ok_name and ok_av:
@@ -908,7 +1042,7 @@ class Worker(QThread):
         self.log.emit(f"{icon} 🏁 Конец: {finished_cause}. Прогресс: {processed_total}/{total_target} (успешно: {success_total}, ошибки: {fail_total})")
 
 
-    def task_register_accounts_parallel(self, count: int, change_nick: bool = True, change_avatar: bool = True, words_file: Optional[str] = None, reg_proxy: Optional[str] = None, delay_min_ms: int = 400, delay_max_ms: int = 900, proxies: Optional[List[str]] = None, threads: int = 1, proxies_per_thread: int = 0):
+    def task_register_accounts_parallel(self, count: int, change_nick: bool = True, change_avatar: bool = True, words_file: Optional[str] = None, reg_proxy: Optional[str] = None, delay_min_ms: int = 400, delay_max_ms: int = 900, proxies: Optional[List[str]] = None, threads: int = 1, proxies_per_thread: int = 0, avatar_path: Optional[str] = None):
         """Параллельная регистрация аккаунтов с разбиением по потокам и спискам прокси.
         - threads: количество потоков (>=1)
         - proxies_per_thread: сколько прокси выделить на поток (0 = авто-деление)
@@ -983,6 +1117,15 @@ class Worker(QThread):
                     proxy_groups.append(proxies_all[s:e])
             else:
                 proxy_groups = [[] for _ in range(threads)]
+        # Однократная загрузка аватара для всех потоков (если нужно)
+        avatar_url_common: Optional[str] = None
+        if change_avatar and avatar_path:
+            try:
+                avatar_url_common = self._upload_avatar_tmpfiles(avatar_path)
+                if avatar_url_common:
+                    self.log.emit(f"{Icons.SUCCESS} [AVATAR] Загружен на tmpfiles: {avatar_url_common}")
+            except Exception as e:
+                self.log.emit(f"{Icons.WARNING} [AVATAR] Не удалось загрузить аватар: {e}")
         # Глобальная пометка IP Limit прокси (на случай дубликатов между группами)
         import threading, queue
         ip_limit_global: Set[str] = set()
@@ -1223,7 +1366,12 @@ class Worker(QThread):
                     except Exception:
                         pass
                     if code != 0:
-                        self.log.emit(f"{Icons.ERROR} [T{worker_idx}] Регистрация {username} отклонена: code={code} msg={msg}")
+                        # Более понятная причина вместо raw code/msg
+                        try:
+                            reason_h = _classify_reason(f"code={code} {msg}")
+                        except Exception:
+                            reason_h = f"code={code} {msg}"
+                        self.log.emit(f"{Icons.ERROR} [T{worker_idx}] Регистрация {username} отклонена: {reason_h}")
                         # задача считается выполненной (попытка была), не возвращаем в очередь
                         with counts_lock:
                             fail_total += 1
@@ -1261,12 +1409,15 @@ class Worker(QThread):
                             endpoints = [(host,port)]
                         avatar_url = None
                         if change_avatar:
-                            try:
-                                avatar_url = DEFAULT_AVATAR_URLS[0] if DEFAULT_AVATAR_URLS else None
-                            except Exception:
-                                avatar_url = None
+                            if avatar_url_common:
+                                avatar_url = avatar_url_common
+                            else:
+                                try:
+                                    avatar_url = DEFAULT_AVATAR_URLS[0] if DEFAULT_AVATAR_URLS else None
+                                except Exception:
+                                    avatar_url = None
                             if not avatar_url:
-                                self.log.emit(f"{Icons.INFO} [T{worker_idx}] Смена аватара [{username}]: пропущено (нет URL по умолчанию)")
+                                self.log.emit(f"{Icons.INFO} [T{worker_idx}] Смена аватара [{username}]: пропущено (нет URL)")
                         max_attempts = max(1, min(3, 1+len(endpoints)))
                         ok_name = (not change_nick)
                         ok_av = (not change_avatar) or (avatar_url is None)
@@ -1277,7 +1428,7 @@ class Worker(QThread):
                             tcp = None
                             try:
                                 self.log.emit(f"{Icons.PROCESS} [T{worker_idx}] TCP попытка {attempt_n}/{max_attempts} для [{username}] через {ehost}:{eport}")
-                                tcp = XClubTCPClient(host=ehost, port=eport, timeout=3.5, proxy=api.proxy_url, disable_bootstrap=True, frida_strict=True, fallback_endpoints=fallbacks)
+                                tcp = XClubTCPClient(host=ehost, port=eport, timeout=4.5, proxy=api.proxy_url, disable_bootstrap=True, frida_strict=True, fallback_endpoints=fallbacks)
                                 try:
                                     tcp.set_cancel_event(self._cancel_event)
                                 except Exception:
@@ -1639,12 +1790,13 @@ class GenerateAccountsDialog(QDialog):
     - Задержка MIN (мс)
     - Задержка MAX (мс)
     - Добавить аватарку (по умолчанию включено)
+    - Путь к файлу аватара (один раз заливается и используется для всех)
     """
-    def __init__(self, *, default_count: int = 100, default_proxies_text: str = "", default_dmin: int = 400, default_dmax: int = 900, default_set_avatar: bool = True, default_threads: int = 1, default_ppt: int = 0, parent=None):
+    def __init__(self, *, default_count: int = 100, default_proxies_text: str = "", default_dmin: int = 400, default_dmax: int = 900, default_set_avatar: bool = True, default_threads: int = 1, default_ppt: int = 0, default_avatar_path: str = "", parent=None):
         super().__init__(parent)
         self.setWindowTitle("Сгенерировать аккаунты")
         self.setModal(True)
-        self.resize(560, 420)
+        self.resize(600, 520)
         v = QVBoxLayout(self)
         form = QFormLayout()
         # Кол-во
@@ -1664,10 +1816,29 @@ class GenerateAccountsDialog(QDialog):
         par_row.addSpacing(16)
         par_row.addWidget(QLabel("Прокси на поток (0=авто):")); par_row.addWidget(self.spn_ppt)
         form.addRow("Параллелизм:", par_row)
-        # Опция: добавить аватарку
+        # Опция: добавить аватарку + выбор файла
         self.chk_set_avatar = QCheckBox("Добавить аватарку")
         self.chk_set_avatar.setChecked(bool(default_set_avatar))
         form.addRow("Добавить аватарку:", self.chk_set_avatar)
+        avatar_row = QHBoxLayout()
+        self.ed_avatar_path = QLineEdit()
+        self.ed_avatar_path.setPlaceholderText("Путь к картинке (png/jpg)")
+        if default_avatar_path:
+            self.ed_avatar_path.setText(default_avatar_path)
+        btn_browse = QPushButton("Выбрать файл…")
+        def _pick_file():
+            path, _ = QFileDialog.getOpenFileName(self, "Выберите картинку", "", "Images (*.png *.jpg *.jpeg *.webp)")
+            if path:
+                self.ed_avatar_path.setText(path)
+        btn_browse.clicked.connect(_pick_file)
+        avatar_row.addWidget(self.ed_avatar_path)
+        avatar_row.addWidget(btn_browse)
+        form.addRow("Файл аватара:", avatar_row)
+        def _toggle_avatar(e):
+            en = self.chk_set_avatar.isChecked()
+            self.ed_avatar_path.setEnabled(en); btn_browse.setEnabled(en)
+        self.chk_set_avatar.toggled.connect(_toggle_avatar)
+        _toggle_avatar(True)
         # Задержки
         delays_row = QHBoxLayout()
         self.spn_delay_min = QSpinBox(); self.spn_delay_min.setRange(0, 600000); self.spn_delay_min.setValue(max(0, int(default_dmin)))
@@ -1683,7 +1854,7 @@ class GenerateAccountsDialog(QDialog):
         buttons.rejected.connect(self.reject)
         v.addWidget(buttons)
 
-    def get_values(self) -> tuple[int, list[str], int, int, bool, int, int]:
+    def get_values(self) -> tuple[int, list[str], int, int, bool, int, int, str]:
         try:
             cnt = int(self.spn_count.value())
             dmin = int(self.spn_delay_min.value())
@@ -1697,9 +1868,48 @@ class GenerateAccountsDialog(QDialog):
             set_avatar = bool(self.chk_set_avatar.isChecked())
             threads = int(self.spn_threads.value())
             ppt = int(self.spn_ppt.value())
-            return cnt, proxies, dmin, dmax, set_avatar, threads, ppt
+            avatar_path = (self.ed_avatar_path.text().strip() if set_avatar else "")
+            return cnt, proxies, dmin, dmax, set_avatar, threads, ppt, avatar_path
         except Exception:
-            return 0, [], 0, 0, True, 1, 0
+            return 0, [], 0, 0, True, 1, 0, ""
+
+    # -------- helper: upload avatar to tmpfiles and return direct dl URL --------
+    def _upload_avatar_tmpfiles(self, file_path: str) -> Optional[str]:
+        try:
+            fn = os.path.basename(file_path)
+            with open(file_path, 'rb') as f:
+                files = {'file': (fn, f, 'application/octet-stream')}
+                r = requests.post('https://tmpfiles.org/api/v1/upload', files=files, timeout=25)
+            r.raise_for_status()
+            try:
+                j = r.json()
+            except Exception:
+                j = None
+            url = None
+            if isinstance(j, dict):
+                url = (j.get('data', {}) or {}).get('url') or j.get('url')
+            if not url:
+                txt = (r.text or '')
+                import re
+                m = re.search(r'https?://tmpfiles\.org/[^\s"]+', txt)
+                if m:
+                    url = m.group(0)
+            if not url:
+                return None
+            # Build direct dl URL
+            # Expected share url like https://tmpfiles.org/1234567/filename or /f/1234567/filename
+            import re
+            m = re.search(r'tmpfiles\.org/(?:f/)?(\d+)/(.*)$', url)
+            if m:
+                file_id, fname = m.group(1), m.group(2)
+                dl = f'https://tmpfiles.org/dl/{file_id}/{fname}'
+                return dl
+            # If already a direct link or unknown pattern
+            if '/dl/' in url:
+                return url
+            return url
+        except Exception:
+            return None
 
 class UpdateDownloadThread(QThread):
     progress = pyqtSignal(int)
@@ -2845,10 +3055,11 @@ class MainWindow(QMainWindow):
         def_set_avatar = getattr(self, 'reg_set_avatar_last', True)
         def_threads = getattr(self, 'reg_threads_last', 1)
         def_ppt = getattr(self, 'reg_ppt_last', 0)
-        dlg = GenerateAccountsDialog(default_count=100, default_proxies_text=default_proxies_text, default_dmin=dmin, default_dmax=dmax, default_set_avatar=def_set_avatar, default_threads=def_threads, default_ppt=def_ppt, parent=self)
+        def_avatar_path = getattr(self, 'reg_avatar_path_last', '')
+        dlg = GenerateAccountsDialog(default_count=100, default_proxies_text=default_proxies_text, default_dmin=dmin, default_dmax=dmax, default_set_avatar=def_set_avatar, default_threads=def_threads, default_ppt=def_ppt, default_avatar_path=def_avatar_path, parent=self)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
-        cnt, proxies_list, delay_min_ms, delay_max_ms, set_avatar, threads, ppt = dlg.get_values()
+        cnt, proxies_list, delay_min_ms, delay_max_ms, set_avatar, threads, ppt, avatar_path = dlg.get_values()
         if cnt <= 0:
             return
         if self.worker.isRunning():
@@ -2860,12 +3071,13 @@ class MainWindow(QMainWindow):
         self.reg_set_avatar_last = bool(set_avatar)
         self.reg_threads_last = int(max(1, threads))
         self.reg_ppt_last = int(max(0, ppt))
+        self.reg_avatar_path_last = avatar_path or getattr(self, 'reg_avatar_path_last', '')
         self.save_settings()
         # Запускаем задачу регистрации (параллельно если threads>1)
         if int(threads) > 1:
-            self.worker.set_task(self.worker.task_register_accounts_parallel, cnt, True, bool(set_avatar), 'files/words.txt', None, delay_min_ms, delay_max_ms, proxies_list, int(threads), int(ppt))
+            self.worker.set_task(self.worker.task_register_accounts_parallel, cnt, True, bool(set_avatar), 'files/words.txt', None, delay_min_ms, delay_max_ms, proxies_list, int(threads), int(ppt), (avatar_path or None))
         else:
-            self.worker.set_task(self.worker.task_register_accounts, cnt, True, bool(set_avatar), 'files/words.txt', None, delay_min_ms, delay_max_ms, proxies_list)
+            self.worker.set_task(self.worker.task_register_accounts, cnt, True, bool(set_avatar), 'files/words.txt', None, delay_min_ms, delay_max_ms, proxies_list, (avatar_path or None))
         self.worker.start()
 
     def on_new_account(self, acc: Account):
@@ -3468,6 +3680,7 @@ class MainWindow(QMainWindow):
                 'reg_set_avatar': bool(getattr(self, 'reg_set_avatar_last', True)),
                 'reg_threads': int(getattr(self, 'reg_threads_last', 1)),
                 'reg_proxies_per_thread': int(getattr(self, 'reg_ppt_last', 0)),
+                'reg_avatar_path': str(getattr(self, 'reg_avatar_path_last', '')),
             }
         }
         try:
@@ -3548,6 +3761,7 @@ class MainWindow(QMainWindow):
             self.reg_set_avatar_last = bool(ui_settings.get('reg_set_avatar', True))
             self.reg_threads_last = int(ui_settings.get('reg_threads', 1))
             self.reg_ppt_last = int(ui_settings.get('reg_proxies_per_thread', 0))
+            self.reg_avatar_path_last = ui_settings.get('reg_avatar_path', '')
             # Установить выбор в комбобоксе
             try:
                 idx = next(i for i in range(self.cmb_theme.count()) if self.cmb_theme.itemData(i) == theme_mode)

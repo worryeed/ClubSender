@@ -350,6 +350,8 @@ class XClubTCPClient:
                         self.close()
                     except Exception:
                         pass
+                    # Малый интервал перед следующей попыткой подключения
+                    time.sleep(0.5)
                     # advance rr index and try next
                     self._rr_index = (endpoints.index((h, p)) + 1) % n
                     continue
