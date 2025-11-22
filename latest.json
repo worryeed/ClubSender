@@ -1,10 +1,1 @@
-{
-  "version": "1.1.4",
-  "notes": "Fix stop-resume login; avatar apply in registration; TCP tuning; dynamic versions; PPPoker preflight; cleanup.",
-  "assets": {
-    "windows": {
-      "url": "https://github.com/worryeed/ClubSender/releases/download/v1.1.4/ClubSender.exe",
-      "sha256": "69C9328F9CD1D24DAAA56B275A47B6F886657999DCB925BC59E1489DAFC7478F"
-    }
-  }
-}
+{ "version": "1.1.5", "notes": "PPPoker: username-шифрование (XXTEA includeLength t10+'d56590'), авторег PPPoker и CSV-лог, фиксы параллельного логирования, мелкие улучшения.", "assets": { "windows": { "url": "https://github.com/worryeed/ClubSender/releases/download/v1.1.5/ClubSender.exe", "sha256": "42437414A074DCB31B03DFD497F787E3E01EA3B54F5AA77FC02A9749E3F2FA87" } } }
