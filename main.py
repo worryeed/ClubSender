@@ -575,6 +575,462 @@ class Worker(QThread):
         except Exception:
             return None
 
+    # ===== PPPoker helpers =====
+    def _ppp_imei40(self, seed: str) -> str:
+        try:
+            import hashlib
+            s = (seed or '').replace('-', '').strip() or 'pppoker'
+            return hashlib.sha1(s.encode('utf-8')).hexdigest()
+        except Exception:
+            return 'd98cc29319f8ff44f171963a3f959a0c07803c4a'
+
+    def _ppp_upload_avatar(self, api, uid: int, image_path: str) -> Optional[str]:
+        try:
+            import mimetypes
+            url = 'https://www.pppoker.club/poker/api/icon_up.php'
+            params = {
+                'rdkey': getattr(api, 'token', '') or '',
+                'uid': str(int(uid)),
+                'type': 'user',
+                'clubid': '0',
+            }
+            mt, _ = mimetypes.guess_type(image_path)
+            if not mt:
+                mt = 'image/jpeg'
+            fn = os.path.basename(image_path) or 'icon.jpg'
+            with open(image_path, 'rb') as f:
+                files = {'icon': (fn, f, mt)}
+                data = {'act': 'upload', 'submit': 'upload'}
+                r = requests.post(url, params=params, data=data, files=files, timeout=30, proxies=getattr(api, 'proxies', None), verify=False)
+            r.raise_for_status()
+            try:
+                j = r.json()
+            except Exception:
+                j = None
+            if isinstance(j, dict) and int(j.get('code', -1)) == 0:
+                return str(j.get('icon') or '')
+            return None
+        except Exception:
+            return None
+
+    def task_register_pppoker(self, count: int, change_nick: bool = True, change_avatar: bool = True, words_file: Optional[str] = None, reg_proxy: Optional[str] = None, delay_min_ms: int = 400, delay_max_ms: int = 900, proxies: Optional[List[str]] = None, avatar_path: Optional[str] = None):
+        """Регистрация для PPPoker: по факту login создаёт нового пользователя.
+        Для каждого аккаунта: HTTP login -> (опц.) HTTP upload avatar -> (опц.) TCP change nick -> emit new_account.
+        """
+        try:
+            self._stop = False
+            if hasattr(self, "_cancel_event"):
+                self._cancel_event.clear()
+        except Exception:
+            pass
+        # Настроим джиттер
+        try:
+            a = int(delay_min_ms); b = int(delay_max_ms)
+            if b < a: a,b = b,a
+            self.jitter_ms = (max(0,a), max(0,b))
+        except Exception:
+            self.jitter_ms = (400,900)
+        # Подготовим генератор
+        try:
+            from core.credgen import CredGenerator
+        except Exception as e:
+            self.log.emit(f"{Icons.ERROR} Не удалось импортировать генератор: {e}")
+            return
+        gen = CredGenerator(words_file=words_file)
+        proxies = [p.strip() for p in (proxies or []) if p and p.strip()]
+        proxy_count = len(proxies)
+        proxy_idx = 0 if proxy_count>0 else -1
+        used_usernames: Set[str] = set()
+        # Подготовим CSV лог так же, как для XPoker
+        regs_file = None
+        regs_writer = None
+        try:
+            from pathlib import Path
+            import csv
+            regs_path = Path('logs')/"registrations.csv"
+            regs_path.parent.mkdir(parents=True, exist_ok=True)
+            is_new = not regs_path.exists() or regs_path.stat().st_size == 0
+            regs_file = regs_path.open('a', encoding='utf-8', newline='')
+            regs_writer = csv.writer(regs_file)
+            if is_new:
+                regs_writer.writerow(["ts","username","password","nick","device_id","code","msg","uid"])
+        except Exception:
+            regs_file = None
+            regs_writer = None
+        def current_proxy() -> Optional[str]:
+            nonlocal proxy_idx
+            if proxy_count == 0:
+                return reg_proxy
+            p = proxies[proxy_idx]
+            proxy_idx = (proxy_idx + 1) % proxy_count
+            return p
+        processed_total = 0
+        success_total = 0
+        fail_total = 0
+        for i in range(int(count)):
+            if self._stop:
+                break
+            # creds
+            username = gen.generate_login(min_len=6, max_len=16)
+            while username in used_usernames:
+                username = gen.generate_login(min_len=6, max_len=16)
+            used_usernames.add(username)
+            nick = gen.derive_nick(username, min_len=6, max_len=20)
+            password = gen.generate_password(min_len=6, max_len=16)
+            # device id seed -> imei40
+            import uuid
+            seed = str(uuid.uuid4())
+            imei = self._ppp_imei40(seed)
+            self.log.emit(f"{Icons.PROCESS} [PP] Регистрация [{i+1}/{count}] {username}")
+            # API register, then login (mirrors official client flow)
+            try:
+                from pppoker.api import PPPokerAPI, ApiError as PPPApiError
+            except Exception as e:
+                self.log.emit(f"{Icons.ERROR} PPPoker API недоступен: {e}")
+                break
+            api = PPPokerAPI(proxy=current_proxy())
+            try:
+                self._live_apis.add(api)
+            except Exception:
+                pass
+            # attempt a few username retries on code -3 (seen as reject)
+            max_username_retries = 6
+            attempt = 0
+            reg_ok = False
+            while attempt <= max_username_retries and not reg_ok:
+                try:
+                    reg_rsp = api.register(username=username, password=password, device_id=imei)
+                    reg_code = int(reg_rsp.get('code', -1)) if isinstance(reg_rsp, dict) else -1
+                except Exception as e:
+                    reg_code = -999
+                if reg_code == 0:
+                    reg_ok = True
+                    break
+                attempt += 1
+                if attempt <= max_username_retries:
+                    old = username
+                    username = gen.generate_login(min_len=6, max_len=16)
+                    self.log.emit(f"{Icons.WARNING} [PP] Имя отклонено (code={reg_code}), новая попытка: {old} → {username} ({attempt}/{max_username_retries})")
+                    time.sleep(self._rand_delay())
+            if not reg_ok:
+                self.log.emit(f"{Icons.ERROR} [PP] Регистрация отклонена окончательно")
+                fail_total += 1; processed_total += 1
+                time.sleep(self._rand_delay())
+                continue
+            # immediate login
+            try:
+                data = api.login(username=username, password=password, device_id=imei)
+            except Exception as e:
+                self.log.emit(f"{Icons.ERROR} [PP] Ошибка login после регистрации: {e}")
+                fail_total += 1; processed_total += 1
+                time.sleep(self._rand_delay())
+                continue
+            code = int(data.get('code', -1)) if isinstance(data, dict) else -1
+            if code != 0 or not api.token:
+                self.log.emit(f"{Icons.ERROR} [PP] Login отклонён: code={code}")
+                fail_total += 1; processed_total += 1
+                time.sleep(self._rand_delay())
+                continue
+            uid = api.get_uid_from_login_response(data)
+            # Avatar via HTTP per-account
+            if change_avatar and avatar_path and uid:
+                try:
+                    url = self._ppp_upload_avatar(api, int(uid), avatar_path)
+                    if url:
+                        self.log.emit(f"{Icons.INFO} [PP] Аватар загружен: {url}")
+                    else:
+                        self.log.emit(f"{Icons.WARNING} [PP] Аватар не загружен")
+                except Exception as e:
+                    self.log.emit(f"{Icons.WARNING} [PP] Ошибка загрузки аватара: {e}")
+            # TCP change name
+            if change_nick and uid and api.token:
+                try:
+                    from pppoker.client import PPPokerTCPClient
+                    host = getattr(api, 'tcp_host', None) or 'ali-entry.pppoker.club'
+                    port = int(getattr(api, 'tcp_port', None) or 4000)
+                    tcp = PPPokerTCPClient(host=host, port=port, timeout=5.0, proxy=api.proxy_url)
+                    try:
+                        tcp.clientver = getattr(api, 'client_version', '4.2.41')
+                    except Exception:
+                        pass
+                    try:
+                        tcp.connect()
+                        ok_login, msg = tcp.tcp_login(uid=int(uid), token=api.token, clientip='', entry_host=host, entry_port=port)
+                        if not ok_login:
+                            raise RuntimeError(f"tcp_login: {msg}")
+                        okn, rsp = tcp.change_username(nickname=nick)
+                        self.log.emit(f"{Icons.INFO} [PP] Смена ника [{username}] → '{nick}': {'успех' if okn else rsp}")
+                    except Exception as e:
+                        self.log.emit(f"{Icons.WARNING} [PP] TCP изменение профиля: {e}")
+                    finally:
+                        try:
+                            tcp.close()
+                        except Exception:
+                            pass
+                except Exception as e:
+                    self.log.emit(f"{Icons.WARNING} [PP] TCP клиент недоступен: {e}")
+            # Emit account
+            acc = Account(username=username, password=password, device_id=imei)
+            acc.proxy = api.proxy_url
+            acc.token = api.token
+            acc.uid = int(uid) if uid else None
+            acc.last_login_at = time.time()
+            try:
+                acc.headers = api.session.headers.copy() if hasattr(api, 'session') else {}
+            except Exception:
+                acc.headers = {}
+            self.new_account.emit(acc)
+            self.log.emit(f"{Icons.SUCCESS} [PP] Зарегистрирован аккаунт: {username} (uid={acc.uid})")
+            # Запишем в общий CSV (как у XPoker) с пометкой PPPoker
+            try:
+                if regs_writer is not None:
+                    import datetime
+                    regs_writer.writerow([
+                        datetime.datetime.utcnow().isoformat(),
+                        username,
+                        password,
+                        nick,
+                        imei,
+                        0,
+                        'PPPoker',
+                        acc.uid or ''
+                    ])
+                    regs_file.flush()  # type: ignore[attr-defined]
+            except Exception:
+                pass
+            success_total += 1
+            processed_total += 1
+            time.sleep(self._rand_delay())
+        # Закроем CSV
+        try:
+            if regs_file:
+                regs_file.close()
+        except Exception:
+            pass
+        self.log.emit(f"{Icons.SUCCESS if fail_total==0 else Icons.INFO} 🏁 Конец PPPoker: {processed_total}/{count} (успешно: {success_total}, ошибки: {fail_total})")
+
+    def task_register_pppoker_parallel(self, count: int, change_nick: bool = True, change_avatar: bool = True, words_file: Optional[str] = None, reg_proxy: Optional[str] = None, delay_min_ms: int = 400, delay_max_ms: int = 900, proxies: Optional[List[str]] = None, threads: int = 1, proxies_per_thread: int = 0, avatar_path: Optional[str] = None):
+        """Параллельная регистрация PPPoker по общей очереди задач (как XPoker)."""
+        try:
+            self._stop = False
+            if hasattr(self, "_cancel_event"):
+                self._cancel_event.clear()
+        except Exception:
+            pass
+        try:
+            threads = max(1, int(threads))
+        except Exception:
+            threads = 1
+        if threads <= 1:
+            return self.task_register_pppoker(count, change_nick, change_avatar, words_file, reg_proxy, delay_min_ms, delay_max_ms, proxies, avatar_path)
+        # jitter
+        try:
+            a = int(delay_min_ms); b = int(delay_max_ms)
+            if b < a: a,b = b,a
+            self.jitter_ms = (max(0,a), max(0,b))
+        except Exception:
+            self.jitter_ms = (400,900)
+        import threading, queue, uuid
+        # split proxies into per-thread groups
+        proxies_all = [p.strip() for p in (proxies or []) if p and p.strip()]
+        import random
+        random.shuffle(proxies_all)
+        ppt = max(0, int(proxies_per_thread))
+        proxy_groups: list[list[str]] = []
+        if ppt > 0 and proxies_all:
+            it = iter(proxies_all)
+            for _ in range(threads):
+                grp = []
+                for _k in range(ppt):
+                    try:
+                        grp.append(next(it))
+                    except StopIteration:
+                        break
+                proxy_groups.append(grp)
+        else:
+            if proxies_all:
+                chunk = (len(proxies_all) + threads - 1)//threads
+                for i in range(threads):
+                    s=i*chunk; e=min(len(proxies_all),(i+1)*chunk)
+                    proxy_groups.append(proxies_all[s:e])
+            else:
+                proxy_groups = [[] for _ in range(threads)]
+        # Подготовим CSV лог и общий лок, как в XPoker parallel
+        from pathlib import Path
+        import csv
+        regs_path = Path('logs')/"registrations.csv"
+        regs_path.parent.mkdir(parents=True, exist_ok=True)
+        regs_file = regs_path.open('a', encoding='utf-8', newline='')
+        regs_writer = csv.writer(regs_file)
+        try:
+            if regs_path.stat().st_size == 0:
+                regs_writer.writerow(["ts","username","password","nick","device_id","code","msg","uid"])
+        except Exception:
+            pass
+        csv_lock = threading.Lock()
+        # queue of jobs
+        q: "queue.Queue[int]" = queue.Queue()
+        for j in range(int(count)):
+            q.put(j+1)
+        counts_lock = threading.Lock()
+        processed_total = 0
+        success_total = 0
+        fail_total = 0
+        usernames_global: Set[str] = set()
+        usernames_lock = threading.Lock()
+        def worker_fn(wi: int, pgroup: list[str]):
+            nonlocal processed_total, success_total, fail_total
+            try:
+                from core.credgen import CredGenerator
+                from pppoker.api import PPPokerAPI
+                from pppoker.client import PPPokerTCPClient
+            except Exception as e:
+                self.log.emit(f"{Icons.ERROR} [T{wi}] Импорты недоступны: {e}")
+                return
+            gen = CredGenerator(words_file=words_file)
+            proxy_idx = 0
+            def current_proxy() -> Optional[str]:
+                nonlocal proxy_idx
+                if not pgroup:
+                    return reg_proxy
+                p = pgroup[proxy_idx % len(pgroup)]; proxy_idx+=1
+                return p
+            while not self._stop:
+                try:
+                    token = q.get_nowait()
+                except queue.Empty:
+                    break
+                try:
+                    # reserve unique username
+                    while True:
+                        cand = gen.generate_login(min_len=6, max_len=16)
+                        with usernames_lock:
+                            if cand not in usernames_global:
+                                usernames_global.add(cand)
+                                break
+                    username = cand
+                    nick = gen.derive_nick(username, min_len=6, max_len=20)
+                    password = gen.generate_password(min_len=6, max_len=16)
+                    imei = self._ppp_imei40(str(uuid.uuid4()))
+                    api = PPPokerAPI(proxy=current_proxy())
+                    # explicit register + login
+                    reg_ok = False
+                    max_username_retries = 4
+                    attempt = 0
+                    while attempt <= max_username_retries and not reg_ok:
+                        try:
+                            reg_rsp = api.register(username=username, password=password, device_id=imei)
+                            reg_code = int(reg_rsp.get('code', -1)) if isinstance(reg_rsp, dict) else -1
+                        except Exception:
+                            reg_code = -999
+                        if reg_code == 0:
+                            reg_ok = True
+                            break
+                        attempt += 1
+                        if attempt <= max_username_retries:
+                            old = username
+                            # reserve new username
+                            while True:
+                                cand = gen.generate_login(min_len=6, max_len=16)
+                                with usernames_lock:
+                                    if cand not in usernames_global:
+                                        usernames_global.add(cand)
+                                        break
+                            username = cand
+                            self.log.emit(f"{Icons.WARNING} [T{wi}] Имя отклонено (code={reg_code}), новая попытка: {old} → {username} ({attempt}/{max_username_retries})")
+                            time.sleep(self._rand_delay())
+                    if not reg_ok:
+                        self.log.emit(f"{Icons.ERROR} [T{wi}] Регистрация отклонена окончательно")
+                        with counts_lock:
+                            fail_total += 1; processed_total += 1
+                        time.sleep(self._rand_delay())
+                        q.task_done();
+                        continue
+                    data = api.login(username=username, password=password, device_id=imei)
+                    code = int(data.get('code', -1)) if isinstance(data, dict) else -1
+                    if code != 0 or not api.token:
+                        self.log.emit(f"{Icons.ERROR} [T{wi}] Login отклонён: code={code}")
+                        with counts_lock:
+                            fail_total += 1; processed_total += 1
+                        time.sleep(self._rand_delay())
+                        q.task_done();
+                        continue
+                    uid = self.api_class().get_uid_from_login_response(data)
+                    # avatar
+                    if change_avatar and avatar_path and uid:
+                        try:
+                            url = self._ppp_upload_avatar(api, int(uid), avatar_path)
+                            if url:
+                                self.log.emit(f"{Icons.INFO} [T{wi}] Аватар загружен: {url}")
+                        except Exception:
+                            pass
+                    # nick via TCP
+                    if change_nick and uid and api.token:
+                        try:
+                            host = getattr(api, 'tcp_host', None) or 'ali-entry.pppoker.club'
+                            port = int(getattr(api, 'tcp_port', None) or 4000)
+                            tcp = PPPokerTCPClient(host=host, port=port, timeout=5.0, proxy=api.proxy_url)
+                            try:
+                                tcp.clientver = getattr(api, 'client_version', '4.2.41')
+                            except Exception:
+                                pass
+                            tcp.connect(); ok_login, msg = tcp.tcp_login(uid=int(uid), token=api.token, clientip='', entry_host=host, entry_port=port)
+                            if ok_login:
+                                okn, rsp = tcp.change_username(nickname=nick)
+                                self.log.emit(f"{Icons.INFO} [T{wi}] Смена ника [{username}] → '{nick}': {'успех' if okn else rsp}")
+                            tcp.close()
+                        except Exception as e:
+                            self.log.emit(f"{Icons.WARNING} [T{wi}] TCP профайл: {e}")
+                    acc = Account(username=username, password=password, device_id=imei)
+                    acc.proxy = api.proxy_url; acc.token = api.token; acc.uid = int(uid) if uid else None; acc.last_login_at = time.time()
+                    try:
+                        acc.headers = api.session.headers.copy() if hasattr(api, 'session') else {}
+                    except Exception:
+                        acc.headers = {}
+                    self.new_account.emit(acc)
+                    self.log.emit(f"{Icons.SUCCESS} [T{wi}] Зарегистрирован аккаунт: {username} (uid={acc.uid})")
+                    # CSV запись (PPPoker)
+                    try:
+                        with csv_lock:
+                            import datetime
+                            regs_writer.writerow([
+                                datetime.datetime.utcnow().isoformat(),
+                                username,
+                                password,
+                                nick,
+                                imei,
+                                0,
+                                'PPPoker',
+                                acc.uid or ''
+                            ])
+                            regs_file.flush()
+                    except Exception:
+                        pass
+                    with counts_lock:
+                        success_total += 1; processed_total += 1
+                    time.sleep(self._rand_delay())
+                except Exception as e:
+                    self.log.emit(f"{Icons.ERROR} [T{wi}] Ошибка регистрации: {e}")
+                finally:
+                    try:
+                        q.task_done()
+                    except Exception:
+                        pass
+        ths = []
+        for i in range(int(threads)):
+            pg = proxy_groups[i] if i < len(proxy_groups) else []
+            import threading
+            t = threading.Thread(target=worker_fn, args=(i+1, pg), daemon=True)
+            ths.append(t); t.start()
+        for t in ths:
+            t.join()
+        try:
+            regs_file.close()
+        except Exception:
+            pass
+        icon = Icons.SUCCESS if fail_total==0 else Icons.INFO
+        self.log.emit(f"{icon} 🏁 Конец PPPoker: {processed_total}/{count} (успешно: {success_total}, ошибки: {fail_total})")
+
     def task_register_accounts(self, count: int, change_nick: bool = True, change_avatar: bool = True, words_file: Optional[str] = None, reg_proxy: Optional[str] = None, delay_min_ms: int = 400, delay_max_ms: int = 900, proxies: Optional[List[str]] = None, avatar_path: Optional[str] = None):
         """Сгенерировать+зарегистрировать N аккаунтов, опционально сменить ник по TCP, добавить в таблицу.
         Работает последовательно. Задержка между шагами — случайная в заданном диапазоне.
@@ -2087,7 +2543,8 @@ class PPPokerTab(QWidget):
         self.btn_delete_account = QPushButton("🗑️ Удалить")
         self.btn_load_accounts = QPushButton("📁 Из Excel файла")
         self.btn_save_accounts = QPushButton("💾 Сохранить настройки")
-        for b in (self.btn_add_account, self.btn_edit_account, self.btn_delete_account, self.btn_load_accounts, self.btn_save_accounts):
+        self.btn_generate_accounts = QPushButton("🧪 Сгенерировать аккаунты")
+        for b in (self.btn_add_account, self.btn_edit_account, self.btn_delete_account, self.btn_load_accounts, self.btn_save_accounts, self.btn_generate_accounts):
             accounts_layout.addWidget(b)
         accounts_layout.addStretch()
         v.addWidget(accounts_group)
@@ -2166,6 +2623,10 @@ class PPPokerTab(QWidget):
         self.worker.task_finished.connect(self.on_task_finished)
         self.worker.pause_changed.connect(self.on_worker_pause_changed)
         self.worker.account_progress.connect(self.on_account_progress)
+        try:
+            self.worker.new_account.connect(self.on_new_account)
+        except Exception:
+            pass
         # Управление состоянием кнопок как в XPoker
         try:
             self.worker.started.connect(self.on_worker_started)
@@ -2179,6 +2640,7 @@ class PPPokerTab(QWidget):
         self.btn_delete_account.clicked.connect(self.on_delete_account)
         self.btn_load_accounts.clicked.connect(self.on_load_accounts)
         self.btn_save_accounts.clicked.connect(self.on_save_accounts)
+        self.btn_generate_accounts.clicked.connect(self.on_generate_accounts)
         self.btn_add_clubs.clicked.connect(self.on_add_clubs)
         self.btn_clear_clubs.clicked.connect(self.on_clear_clubs)
         self.btn_load_clubs.clicked.connect(self.on_load_clubs)
@@ -2546,7 +3008,37 @@ class PPPokerTab(QWidget):
             pass
 
     def on_generate_accounts(self):
-        QMessageBox.information(self, "Недоступно", "Генерация аккаунтов недоступна на этой вкладке.")
+        # Диалог как в XPoker
+        default_proxies_text = getattr(self, 'reg_proxies_last', '')
+        dmin = getattr(self, 'reg_delay_min_last', 400)
+        dmax = getattr(self, 'reg_delay_max_last', 900)
+        def_set_avatar = getattr(self, 'reg_set_avatar_last', True)
+        def_threads = getattr(self, 'reg_threads_last', 1)
+        def_ppt = getattr(self, 'reg_ppt_last', 0)
+        def_avatar_path = getattr(self, 'reg_avatar_path_last', '')
+        dlg = GenerateAccountsDialog(default_count=100, default_proxies_text=default_proxies_text, default_dmin=dmin, default_dmax=dmax, default_set_avatar=def_set_avatar, default_threads=def_threads, default_ppt=def_ppt, default_avatar_path=def_avatar_path, parent=self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        cnt, proxies_list, delay_min_ms, delay_max_ms, set_avatar, threads, ppt, avatar_path = dlg.get_values()
+        if cnt <= 0:
+            return
+        if self.worker.isRunning():
+            QMessageBox.information(self, "Занято", "Процесс уже выполняется"); return
+        # Сохраняем последние параметры
+        self.reg_proxies_last = "\n".join(proxies_list)
+        self.reg_delay_min_last = int(delay_min_ms)
+        self.reg_delay_max_last = int(delay_max_ms)
+        self.reg_set_avatar_last = bool(set_avatar)
+        self.reg_threads_last = int(max(1, threads))
+        self.reg_ppt_last = int(max(0, ppt))
+        self.reg_avatar_path_last = avatar_path or getattr(self, 'reg_avatar_path_last', '')
+        self.save_settings()
+        # Запускаем задачу регистрации PPPoker (параллельно если threads>1)
+        if int(threads) > 1:
+            self.worker.set_task(self.worker.task_register_pppoker_parallel, cnt, True, bool(set_avatar), 'files/words.txt', None, delay_min_ms, delay_max_ms, proxies_list, int(threads), int(ppt), (avatar_path or None))
+        else:
+            self.worker.set_task(self.worker.task_register_pppoker, cnt, True, bool(set_avatar), 'files/words.txt', None, delay_min_ms, delay_max_ms, proxies_list, (avatar_path or None))
+        self.worker.start()
 
     def on_stop(self):
         if self.worker.isRunning():
@@ -2632,6 +3124,13 @@ class PPPokerTab(QWidget):
                 'delay_max_ms': self.spn_delay_max.value(),
                 'shuffle_clubs': self.chk_shuffle.isChecked(),
                 'apply_message': self.txt_message.text(),
+                'reg_proxies': getattr(self, 'reg_proxies_last', ''),
+                'reg_delay_min_ms': int(getattr(self, 'reg_delay_min_last', 400)),
+                'reg_delay_max_ms': int(getattr(self, 'reg_delay_max_last', 900)),
+                'reg_set_avatar': bool(getattr(self, 'reg_set_avatar_last', True)),
+                'reg_threads': int(getattr(self, 'reg_threads_last', 1)),
+                'reg_proxies_per_thread': int(getattr(self, 'reg_ppt_last', 0)),
+                'reg_avatar_path': str(getattr(self, 'reg_avatar_path_last', '')),
             }
         }
         try:
@@ -2675,6 +3174,14 @@ class PPPokerTab(QWidget):
             self.spn_delay_max.setValue(ui.get('delay_max_ms', 1500))
             self.chk_shuffle.setChecked(ui.get('shuffle_clubs', True))
             self.txt_message.setText(ui.get('apply_message',''))
+            # restore last reg params
+            self.reg_proxies_last = ui.get('reg_proxies','')
+            self.reg_delay_min_last = int(ui.get('reg_delay_min_ms', 400))
+            self.reg_delay_max_last = int(ui.get('reg_delay_max_ms', 900))
+            self.reg_set_avatar_last = bool(ui.get('reg_set_avatar', True))
+            self.reg_threads_last = int(ui.get('reg_threads', 1))
+            self.reg_ppt_last = int(ui.get('reg_proxies_per_thread', 0))
+            self.reg_avatar_path_last = ui.get('reg_avatar_path', '')
             self.worker.accounts = self.accounts
             self.log.appendPlainText(f"{Icons.SUCCESS} Загружены настройки: {len(self.accounts)} аккаунтов, {len(self.club_ids)} клубов")
         except Exception:

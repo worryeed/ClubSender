@@ -83,6 +83,50 @@ def encrypt_password_exact(crypto_password_hex: str, epoch: int) -> str:
     return base64.b64encode(out).decode('ascii')
 
 
+def encrypt_username_exact(username: str, epoch: int) -> str:
+    """XXTEA( includeLength ) of UTF-8(username) with key (mmddhhmmss + 'd56590').
+    Output base64 of 24 bytes for typical 18-char names (padded to 4-byte boundary).
+    Verified against captured samples.
+    """
+    DELTA = 0x9E3779B9
+
+    def xxtea_encrypt_lenpack(pt: bytes, key16: bytes) -> bytes:
+        # includeLength packing: split into 4-byte LE words with zero-pad up to (n-1)*4, append len(pt)
+        n = (len(pt) + 4 + 3) // 4  # total u32 words including length word
+        data_len = (n - 1) * 4
+        buf = pt + b"\x00" * (data_len - len(pt))
+        v = [int.from_bytes(buf[i:i+4], 'little') for i in range(0, len(buf), 4)]
+        v.append(len(pt))
+        k = [int.from_bytes(key16[i:i+4], 'little') for i in range(0, 16, 4)]
+        # XXTEA rounds
+        n_words = len(v)
+        if n_words < 2:
+            out = b''.join(x.to_bytes(4, 'little') for x in v)
+            return out
+        z = v[n_words - 1]
+        sum_ = 0
+        q = 6 + 52 // n_words
+        for _ in range(q):
+            sum_ = (sum_ + DELTA) & 0xffffffff
+            e = (sum_ >> 2) & 3
+            for p in range(n_words - 1):
+                y = v[p + 1]
+                mx = (((z >> 5) ^ (y << 2)) + ((y >> 3) ^ (z << 4))) ^ ((sum_ ^ y) + (k[(p & 3) ^ e] ^ z))
+                v[p] = (v[p] + mx) & 0xffffffff
+                z = v[p]
+            y = v[0]
+            mx = (((z >> 5) ^ (y << 2)) + ((y >> 3) ^ (z << 4))) ^ ((sum_ ^ y) + (k[((n_words - 1) & 3) ^ e] ^ z))
+            v[n_words - 1] = (v[n_words - 1] + mx) & 0xffffffff
+            z = v[n_words - 1]
+        return b''.join(x.to_bytes(4, 'little') for x in v)
+
+    t10 = mmddhhmmss_from_epoch_beijing(epoch)
+    key16 = (t10 + "d56590").encode('ascii')
+    pt = username.encode('utf-8')
+    out = xxtea_encrypt_lenpack(pt, key16)
+    return base64.b64encode(out).decode('ascii')
+
+
 def _normalize_imei(device_id: Optional[str], username: str) -> str:
     """Всегда формируем IMEI в нужном формате: 40-символьный hex (SHA1).
     Основано на device_id (без дефисов); если пусто — используем username.
@@ -154,6 +198,42 @@ class PPPokerAPI:
                     self.tcp_entries = [(self.tcp_host, self.tcp_port)]
             except Exception:
                 pass
+        return j
+
+    def register(self, *, username: str, password: str, device_id: str = "") -> Dict[str, Any]:
+        """PPPoker explicit registration flow (GET register.php), then client should login.
+        Mirrors official client parameters captured from the PC build.
+        """
+        # ensure we have a recent client version
+        try:
+            if not self._version_fetched:
+                self.fetch_server_version()
+        except Exception:
+            pass
+        url = BASE_URL + "/poker/api/register.php"
+        crypto_pw = compute_crypto_password(password)
+        t_epoch = int(time.time())
+        enc_password = encrypt_password_exact(crypto_pw, t_epoch)
+        enc_username = encrypt_username_exact(username, t_epoch)
+        params = {
+            'username': enc_username,
+            'password': enc_password,
+            't': str(t_epoch),
+            'distributor': '0',
+            'sub_distributor': '0',
+            'country': 'RU',
+            'appid': 'globle',
+            'os': 'WindowsPlayer',  # matches capture
+            'imei': _normalize_imei(device_id, username),
+            'clientvar': self.client_version,
+            'app_type': '1',
+        }
+        r = self.session.get(url, params=params, proxies=self.proxies, timeout=self.timeout)
+        r.raise_for_status()
+        try:
+            j = r.json()
+        except Exception as e:
+            raise ApiError(f"Register parse error: {e}")
         return j
 
     def fetch_server_version(self) -> None:

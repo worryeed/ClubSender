@@ -22,6 +22,11 @@ class PPPokerTCPClient:
         self.sock: Optional[socket.socket] = None
         # Default client version; API layer may override via tcp.clientver
         self.clientver: str = '4.2.41'
+        # Optional external cancel event (threading.Event-like)
+        self._cancel_event = None
+
+    def set_cancel_event(self, ev) -> None:
+        self._cancel_event = ev
 
     # ---- proxy helpers (HTTP CONNECT / SOCKS5 via PySocks optional) ----
     def _parse_proxy(self, proxy: Optional[str]):
@@ -120,6 +125,13 @@ class PPPokerTCPClient:
 
     def recv_one(self, timeout: float = 2.0) -> Optional[Tuple[str, bytes]]:
         assert self.sock is not None
+        # allow external cancellation to break long waits
+        if self._cancel_event is not None:
+            try:
+                if getattr(self._cancel_event, 'is_set', lambda: False)():
+                    return None
+            except Exception:
+                pass
         self.sock.settimeout(timeout)
         try:
             head4 = self._recvn(4)
@@ -256,3 +268,30 @@ class PPPokerTCPClient:
                 msg = reason or (f"status={code_signed}" if code_signed is not None else "")
                 return ok, msg
         return False, "no JoinClubRSP"
+
+    # ---- profile ops ----
+    def build_change_username_req(self, *, nickname: str) -> bytes:
+        # Observed pb.ChangeUserNameREQ; field 1 appears to be the new name (string)
+        nb = nickname.encode('utf-8')
+        return varint_encode((1 << 3) | 2) + varint_encode(len(nb)) + nb
+
+    def change_username(self, *, nickname: str) -> Tuple[bool, str]:
+        if not self.sock:
+            self.connect()
+        payload = self.build_change_username_req(nickname=nickname)
+        frame = build_frame('pb.ChangeUserNameREQ', payload)
+        assert self.sock is not None
+        self.sock.sendall(frame)
+        # Server may send intermediate frames (e.g., DiamondRSP, HeartBeatRSP). Wait for ChangeUserNameRSP
+        for _ in range(20):
+            r = self.recv_one(timeout=1.0)
+            if not r:
+                continue
+            t, p = r
+            if t == 'pb.ChangeUserNameRSP':
+                fields = parse_top_fields(p)
+                # success if echoed string equals nickname or if any field present
+                new_name = next((f.get('str') for f in fields if f.get('wt') == 2 and f.get('str')), '')
+                ok = (new_name == nickname) or bool(fields)
+                return ok, (new_name or 'ok')
+        return False, 'no ChangeUserNameRSP'
