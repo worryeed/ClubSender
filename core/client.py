@@ -372,14 +372,19 @@ class XClubTCPClient:
         
     def _safe_send_frame(self, payload: bytes) -> None:
         """Safely send a framed payload (adds 4-byte length) over the socket, with reconnect if needed."""
+        # Ensure we have a connected socket; attempt reconnect if allowed
         if not self.connected:
             if not self.ensure_connected():
                 raise DisconnectedError("No TCP connection established")
+        # Capture socket reference atomically and re-validate
+        s = self.sock
+        if s is None:
+            raise DisconnectedError("No TCP socket available for send")
         try:
-            frame_send(self.sock, payload)  # type: ignore[arg-type]
+            frame_send(s, payload)
         except Exception as e:
             log.debug(f"Frame send failed: {e}")
-            # mark disconnected
+            # mark disconnected and cleanup
             try:
                 self._connected = False
                 if self.sock:
@@ -398,13 +403,19 @@ class XClubTCPClient:
         
     def _safe_sendall(self, packet: bytes) -> None:
         """Safely send a complete packet (already framed) over the socket, with reconnect if needed."""
+        # Ensure we have a connected socket; attempt reconnect if allowed
         if not self.connected:
             if not self.ensure_connected():
                 raise DisconnectedError("No TCP connection established")
+        # Capture socket reference atomically and re-validate
+        s = self.sock
+        if s is None:
+            raise DisconnectedError("No TCP socket available for send")
         try:
-            self.sock.sendall(packet)  # type: ignore[union-attr]
+            s.sendall(packet)
         except Exception as e:
             log.debug(f"Send failed: {e}")
+            # mark disconnected and cleanup
             try:
                 self._connected = False
                 if self.sock:

@@ -9,7 +9,8 @@ DEFAULT_TIMEOUT = 10.0
 XPOKER_CLIENT_VERSION = "1.12.68"
 
 # HTTP API endpoints
-DEFAULT_BASE_URL = "https://api.x-poker.net"
+# Switched to the current production alias behind Cloudflare
+DEFAULT_BASE_URL = "https://api.littleponyygames.com"
 LOGIN_PATH = "/api/auth/login"
 REGISTER_PATH = "/api/auth/register"
 LOGOUT_PATH = "/api/token/logout"

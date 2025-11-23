@@ -180,7 +180,9 @@ class XPokerAPI:
         base_url: str = DEFAULT_BASE_URL,
         proxy: Optional[str] = None,
         headers: Optional[Dict[str, str]] = None,
-        timeout: int = 30
+        timeout: int = 30,
+        *,
+mobile_profile: bool = True,
     ):
         """Initialize API client.
         
@@ -190,6 +192,7 @@ class XPokerAPI:
             headers: Optional additional headers
             timeout: Request timeout in seconds"""
         self.base_url = base_url.rstrip("/")
+        self.mobile_profile = bool(mobile_profile)
         # Disable TLS key logging if set in environment to avoid file handle leaks on massive handshakes
         try:
             if os.environ.get('SSLKEYLOGFILE'):
@@ -225,6 +228,11 @@ class XPokerAPI:
         log.info(f"HTTP повторы настроены: попыток={self._retry_total}, backoff≈{self._retry_backoff}s")
         
         self.session.headers.update(default_headers())
+        if self.mobile_profile:
+            try:
+                self.session.headers["User-Agent"] = f"X-Poker/{self.client_version} (Android)"
+            except Exception:
+                pass
         if headers:
             self.session.headers.update(headers)
         self.proxies = to_requests_proxies(proxy)
@@ -403,13 +411,27 @@ class XPokerAPI:
                 log.error(f"❌ Refresh exception: {re}")
         
         if r.status_code >= 400:
-            log.error(f"❌ HTTP Error {r.status_code}: {r.text}")
-            try:
-                httptrace = _get_httptrace()
-                httptrace.error(f"ERR {method} {url} -> {r.status_code} body={r.text[:400]}...")
-            except Exception:
-                pass
-            raise ApiError(f"{r.status_code} {r.text}")
+            ct = str(r.headers.get('Content-Type', '') or '').lower()
+            body_text = r.text or ''
+            is_html = ('text/html' in ct) or body_text.lstrip().lower().startswith('<!doctype') or body_text.lstrip().lower().startswith('<html')
+            if is_html:
+                msg = f"{r.status_code} Доступ заблокирован сетевым фильтром (HTML-страница)"
+                log.error(f"❌ HTTP Error {msg}")
+                try:
+                    httptrace = _get_httptrace()
+                    httptrace.error(f"ERR {method} {url} -> {r.status_code} HTML len={len(body_text) if hasattr(body_text,'__len__') else 'N/A'}")
+                except Exception:
+                    pass
+                raise ApiError(msg)
+            else:
+                short = body_text[:400]
+                log.error(f"❌ HTTP Error {r.status_code}: {short}")
+                try:
+                    httptrace = _get_httptrace()
+                    httptrace.error(f"ERR {method} {url} -> {r.status_code} body={short}...")
+                except Exception:
+                    pass
+                raise ApiError(f"{r.status_code} {short}")
             
         try:
             response_data = r.json()
@@ -449,6 +471,14 @@ class XPokerAPI:
         Returns:
             Login response data"""
         # Use working payload from analysis
+        if self.mobile_profile:
+            try:
+                if os_code == "3":
+                    os_code = "1"
+                if device == "windows":
+                    device = "android"
+            except Exception:
+                pass
         payload = {
             "timezoneId": timezone_id,
             "appLevel": app_level,
@@ -571,6 +601,14 @@ class XPokerAPI:
         The registration payload mirrors login fields and uses the same double MD5
         password scheme and timestamp/sign generation.
         """
+        if self.mobile_profile:
+            try:
+                if os_code == "3":
+                    os_code = "1"
+                if device == "windows":
+                    device = "android"
+            except Exception:
+                pass
         payload = {
             "timezoneId": timezone_id,
             "appLevel": app_level,
@@ -933,7 +971,8 @@ class XPokerAPI:
                     try:
                         ua = self.session.headers.get("User-Agent", "")
                         if ua.startswith("X-Poker/"):
-                            new_ua = f"X-Poker/{ver} (Windows)"
+                            platform_label = "Android" if getattr(self, 'mobile_profile', False) else "Windows"
+                            new_ua = f"X-Poker/{ver} ({platform_label})"
                             self.session.headers["User-Agent"] = new_ua
                     except Exception:
                         pass

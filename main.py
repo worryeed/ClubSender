@@ -188,11 +188,17 @@ class Worker(QThread):
         # Запускаем по одному потоку на каждую группу
         import threading
         threads: list[threading.Thread] = []
+        counts_lock = threading.Lock()
+        processed = 0
+        ok_cnt = 0
+        fail_cnt = 0
         def group_worker(proxy_key: Optional[str], indices: list[int]):
+            nonlocal processed, ok_cnt, fail_cnt
             for idx in indices:
                 if self._stop:
                     break
                 acc = self.accounts[idx]
+                local_success = False
                 try:
                     proxy_info = acc.proxy or 'без прокси'
                     self.log.emit(f"{Icons.AUTH} [{acc.username}] Авторизация через {proxy_info}")
@@ -213,6 +219,7 @@ class Worker(QThread):
                     )
                     token = api.token
                     acc.token = token
+                    local_success = bool(token)
                     # Сохраняем refresh token если есть
                     acc.refresh_token = api.refresh_token
                     acc.access_token_expire = api.access_token_expire
@@ -264,6 +271,16 @@ class Worker(QThread):
                             sess.close()
                     except Exception:
                         pass
+                    # Счётчики
+                    try:
+                        with counts_lock:
+                            processed += 1
+                            if local_success:
+                                ok_cnt += 1
+                            else:
+                                fail_cnt += 1
+                    except Exception:
+                        pass
                 if not self._stop:
                     time.sleep(self._rand_delay())
         for proxy_key, idxs in groups.items():
@@ -292,6 +309,12 @@ class Worker(QThread):
                 t.join(timeout=0.3)
             except Exception:
                 pass
+        # Итоговая строка: сколько вошло и сколько ошибок
+        try:
+            icon = Icons.SUCCESS if fail_cnt == 0 else Icons.INFO
+            self.log.emit(f"{icon} 🏁 Вход завершён: успешно {ok_cnt}, ошибки {fail_cnt}, всего {processed}")
+        except Exception:
+            pass
         self.task_finished.emit()
 
     def task_logout_selected(self, rows: List[int]):
@@ -301,17 +324,34 @@ class Worker(QThread):
             if not acc.token:
                 self.log.emit(f"{Icons.WARNING} [{acc.username}] Выход: нет токена")
                 continue
+            api = None
             try:
                 api = self.api_class(proxy=acc.proxy)
+                try:
+                    self._live_apis.add(api)
+                except Exception:
+                    pass
                 api.logout(acc.token)
                 acc.token = None
                 self.account_updated.emit(r, acc.as_row())
                 self.log.emit(f"{Icons.SUCCESS} [{acc.username}] Выход выполнен успешно")
             except Exception as e:
                 self.log.emit(f"{Icons.ERROR} [{acc.username}] Ошибка выхода: {e}")
+            finally:
+                try:
+                    if api is not None:
+                        sess = getattr(api, 'session', None)
+                        if sess is not None:
+                            sess.close()
+                        try:
+                            self._live_apis.discard(api)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
             time.sleep(self._rand_delay())
 
-    def task_join_round(self, club_ids: List[str], clubs_per_account: int, delay_min_ms: int, delay_max_ms: int, message_text: Optional[str] = None):
+    def task_join_round(self, club_ids: List[str], clubs_per_account: int, delay_min_ms: int, delay_max_ms: int, message_text: Optional[str] = None, join_threads: int = 32):
         # Сброс сигнала остановки и очистка события отмены перед стартом задачи
         try:
             self._stop = False
@@ -394,13 +434,12 @@ class Worker(QThread):
             account_jobs.append((acc, account_clubs))
         
         # Параллельная обработка по аккаунтам: одно TCP-соединение на аккаунт
-        import threading
+        import threading, queue
         processed_clubs_lock = threading.Lock()
         processed_clubs_total = 0
         # Агрегатор результатов по аккаунтам
         agg_lock = threading.Lock()
         agg_results: Dict[str, Dict[str, object]] = {}
-        threads: list[threading.Thread] = []
         
         def account_worker(acc: Account, account_clubs: list[str]):
             nonlocal processed_clubs_total
@@ -410,6 +449,10 @@ class Worker(QThread):
                     self.log.emit(f"{Icons.ERROR} [{acc.username}] UID отсутствует — пропуск аккаунта")
                     return
                 api = self.api_class(proxy=acc.proxy)
+                try:
+                    self._live_apis.add(api)
+                except Exception:
+                    pass
                 api.token = acc.token
                 api.refresh_token = acc.refresh_token
                 # Колбэк прогресса для остановки/паузы
@@ -426,15 +469,72 @@ class Worker(QThread):
                     return True
                 # Колбэк результатов по мере выполнения
                 def result_cb(cid: int, ok: bool, msg: str, idx: int, total: int):
+                    nonlocal processed_clubs_total
                     # Если запрошена остановка — не спамим логами и выходим как можно раньше
                     if self._stop:
                         return
                     done = idx + 1
+                    low = (msg or "").lower()
+                    def _is_transient_tcp(m: str) -> bool:
+                        s = m.lower()
+                        return (
+                            ("no tcp connection" in s) or ("socket error" in s) or ("timed out" in s) or
+                            ("tcp_connect" in s) or ("tcp login" in s) or ("connect timeout" in s) or ("read timed out" in s)
+                        )
+                    # Если временная сетевая ошибка — сделаем 1 повтор через 10с для этого клуба
+                    if not ok and _is_transient_tcp(low):
+                        try:
+                            self.log.emit(f"{Icons.WARNING} [{acc.username}] → Клуб {cid}: временная ошибка сети ({msg}). Повтор через 10с…")
+                        except Exception:
+                            pass
+                        # Пауза с уважением к паузе/стопу
+                        for _ in range(10):
+                            if self._stop:
+                                return
+                            self._wait_if_paused()
+                            time.sleep(1.0)
+                        # Повтор одной попыткой на отдельном TCP
+                        ok2 = False; msg2 = msg
+                        try:
+                            _any2, _res2 = api.join_clubs_tcp([int(cid)], uid=acc.uid, auth_token=acc.token, keepalive=False, progress_cb=None, result_cb=None, cancel_event=self._cancel_event, message_text=message_text)
+                            if _res2:
+                                _, ok2, msg2 = _res2[0]
+                            else:
+                                ok2 = _any2; msg2 = msg2 or ""
+                        except Exception as e:
+                            ok2 = False; msg2 = str(e)
+                        # Финальная фиксация результата после повтора
+                        try:
+                            self.join_result.emit(JoinResult(ts=time.time(), username=acc.username, club_id=str(cid), ok=ok2, message=msg2))
+                            result_msg = format_join_result(acc.username, str(cid), ok2, msg2)
+                            self.log.emit(result_msg)
+                            self.account_progress.emit(acc.username, done, total, ("✅ Клуб есть" if ok2 else "❌ Клуба нет"), str(cid))
+                        except Exception:
+                            pass
+                        with processed_clubs_lock:
+                            processed_clubs_total += 1
+                        # Агрегатор
+                        try:
+                            with agg_lock:
+                                r = agg_results.setdefault(acc.username, {"ok": 0, "fail": 0, "ok_ids": []})
+                                if ok2:
+                                    r["ok"] = int(r.get("ok", 0)) + 1
+                                    try:
+                                        r["ok_ids"].append(str(cid))  # type: ignore
+                                    except Exception:
+                                        pass
+                                else:
+                                    r["fail"] = int(r.get("fail", 0)) + 1
+                        except Exception:
+                            pass
+                        if not self._stop:
+                            time.sleep(self._rand_delay())
+                        return
+                    # Обычная обработка (без повтора)
                     self.join_result.emit(JoinResult(ts=time.time(), username=acc.username, club_id=str(cid), ok=ok, message=msg))
                     result_msg = format_join_result(acc.username, str(cid), ok, msg)
                     self.log.emit(result_msg)
                     self.account_progress.emit(acc.username, done, total, ("✅ Клуб есть" if ok else "❌ Клуба нет"), str(cid))
-                    nonlocal processed_clubs_total
                     with processed_clubs_lock:
                         processed_clubs_total += 1
                     # Сохраним для мини-отчёта
@@ -451,7 +551,6 @@ class Worker(QThread):
                                 r["fail"] = int(r.get("fail", 0)) + 1
                     except Exception:
                         pass
-                    # Избегаем лишнего ожидания после запроса остановки
                     if not self._stop:
                         time.sleep(self._rand_delay())
                 # Преобразуем ID клубов в int
@@ -463,16 +562,50 @@ class Worker(QThread):
                         self.log.emit(f"{Icons.ERROR} [{acc.username}] Неверный формат ID клуба: {cid}")
                 if not club_ids_int:
                     return
-                any_success, results = api.join_clubs_tcp(
-                    club_ids_int,
-                    uid=acc.uid,
-                    auth_token=acc.token,
-                    keepalive=False,
-                    progress_cb=progress_cb,
-                    result_cb=result_cb,
-                    cancel_event=self._cancel_event,
-                    message_text=message_text,
-                )
+                # Одна попытка + 1 повтор при сетевых таймаутах подключения/логина
+                try:
+                    attempt = 0
+                    while attempt < 2:
+                        try:
+                            any_success, results = api.join_clubs_tcp(
+                                club_ids_int,
+                                uid=acc.uid,
+                                auth_token=acc.token,
+                                keepalive=False,
+                                progress_cb=progress_cb,
+                                result_cb=result_cb,
+                                cancel_event=self._cancel_event,
+                                message_text=message_text,
+                            )
+                            break
+                        except self.api_error_class as e:
+                            em = str(e).lower()
+                            transient = ("tcp_connect" in em) or ("tcp_login" in em) or ("timed out" in em) or ("connect timeout" in em)
+                            if transient and attempt == 0 and not self._stop:
+                                try:
+                                    self.log.emit(f"{Icons.WARNING} [{acc.username}] TCP подключение/логин: {e}. Повтор через 10с…")
+                                except Exception:
+                                    pass
+                                for _ in range(10):
+                                    if self._stop:
+                                        break
+                                    self._wait_if_paused(); time.sleep(1.0)
+                                attempt += 1
+                                continue
+                            # Нетребуемая или повторная ошибка — пробрасываем
+                            raise
+                finally:
+                    # Закрываем HTTP-сессию — TCP не зависит от неё
+                    try:
+                        sess = getattr(api, 'session', None)
+                        if sess is not None:
+                            sess.close()
+                        try:
+                            self._live_apis.discard(api)
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
                 # Если остановка запрошена — не эмитим финальный статус для аккуратного молчаливого завершения
                 if self._stop:
                     return
@@ -481,35 +614,48 @@ class Worker(QThread):
             except Exception as e:
                 self.log.emit(f"{Icons.ERROR} [{acc.username}] Ошибка обработки аккаунта: {e}")
         
-        # Стартуем потоки по аккаунтам
+        # Пул потоков по заданиям (аккаунт + его клубы)
+        job_q: "queue.Queue[tuple[Account, list[str]]]" = queue.Queue()
         for acc, acc_clubs in account_jobs:
-            t = threading.Thread(target=account_worker, args=(acc, acc_clubs), daemon=True)
-            threads.append(t)
-            t.start()
-        
-        # Ожидаем завершения всех аккаунтов. При остановке даём короткое время потокам корректно завершиться.
-        stop_deadline = 0.0
-        announced_wait = False
-        while any(t.is_alive() for t in threads):
-            if self._stop:
-                if not announced_wait:
+            job_q.put((acc, acc_clubs))
+        pool_size = max(1, int(join_threads))
+        pool_size = min(pool_size, len(account_jobs) if account_jobs else 1)
+        threads: list[threading.Thread] = []
+        def pool_worker():
+            while not self._stop:
+                try:
+                    acc, acc_clubs = job_q.get_nowait()
+                except queue.Empty:
+                    break
+                try:
+                    account_worker(acc, acc_clubs)
+                except Exception as e:
                     try:
-                        self.log.emit(f"{Icons.INFO} Ожидаем остановки рабочих потоков...")
+                        self.log.emit(f"{Icons.ERROR} [{acc.username}] Ошибка рабочего пула: {e}")
                     except Exception:
                         pass
-                    announced_wait = True
-                    stop_deadline = time.time() + 6.0  # максимум 6с на корректное завершение
-                # Если вышли за дедлайн — прекращаем ожидание
-                if time.time() > stop_deadline:
-                    break
+                finally:
+                    try:
+                        job_q.task_done()
+                    except Exception:
+                        pass
+                    # Избегаем лишнего спина
+                    self._wait_if_paused()
+        for _ in range(pool_size):
+            t = threading.Thread(target=pool_worker, daemon=True)
+            threads.append(t)
+            t.start()
+        # Ждём завершения пула
+        while any(t.is_alive() for t in threads):
+            if self._stop:
+                break
             self._wait_if_paused()
             time.sleep(0.1)
-        # Дополнительно: точечно подождём каждый поток до 300мс, чтобы убрать хвосты логов
-        for t in threads:
-            try:
-                t.join(timeout=0.3)
-            except Exception:
-                pass
+        try:
+            job_q.join()
+        except Exception:
+            pass
+        self.task_finished.emit()
         
         # Итоговый отчёт по вступлению
         planned_clubs = min(total_clubs_needed, len(club_ids))
@@ -641,6 +787,9 @@ class Worker(QThread):
         proxy_count = len(proxies)
         proxy_idx = 0 if proxy_count>0 else -1
         used_usernames: Set[str] = set()
+        # PPPoker: mark IP-limit proxies + remember recent -2 to treat fast -1 as ip-limit (desync)
+        ip_limit_marked: Set[str] = set()
+        recent_ip_until: Dict[str, float] = {}
         # Подготовим CSV лог так же, как для XPoker
         regs_file = None
         regs_writer = None
@@ -661,9 +810,15 @@ class Worker(QThread):
             nonlocal proxy_idx
             if proxy_count == 0:
                 return reg_proxy
-            p = proxies[proxy_idx]
-            proxy_idx = (proxy_idx + 1) % proxy_count
-            return p
+            if proxy_count <= 0:
+                return None
+            # find next proxy not marked with IP limit
+            for _ in range(proxy_count):
+                p = proxies[proxy_idx]
+                proxy_idx = (proxy_idx + 1) % proxy_count
+                if p not in ip_limit_marked:
+                    return p
+            return None
         processed_total = 0
         success_total = 0
         fail_total = 0
@@ -688,30 +843,110 @@ class Worker(QThread):
             except Exception as e:
                 self.log.emit(f"{Icons.ERROR} PPPoker API недоступен: {e}")
                 break
-            api = PPPokerAPI(proxy=current_proxy())
+            api = None
+            curp = current_proxy()
+            api = PPPokerAPI(proxy=curp)
+            # preflight cookie (aliyungf_tc) как в клиенте
+            try:
+                api.session.get('https://www.pppoker.club/', proxies=api.proxies, timeout=10)
+            except Exception:
+                pass
             try:
                 self._live_apis.add(api)
             except Exception:
                 pass
-            # attempt a few username retries on code -3 (seen as reject)
+            # username ретраи только при явной занятости имени; сетевые/лимит-IP → ротация прокси
             max_username_retries = 6
+            max_net_retries = 6
             attempt = 0
+            net_retry = 0
             reg_ok = False
             while attempt <= max_username_retries and not reg_ok:
+                reg_code = -999
+                reg_msg = ''
                 try:
                     reg_rsp = api.register(username=username, password=password, device_id=imei)
                     reg_code = int(reg_rsp.get('code', -1)) if isinstance(reg_rsp, dict) else -1
+                    reg_msg = str(reg_rsp.get('msg','')) if isinstance(reg_rsp, dict) else ''
                 except Exception as e:
                     reg_code = -999
+                    reg_msg = str(e)
                 if reg_code == 0:
                     reg_ok = True
                     break
-                attempt += 1
-                if attempt <= max_username_retries:
+# Классификация PPPoker: -2 = IP limit; -1 = имя занято, но при быстром повторе после -2 может отражать IP limit (десинхрон)
+                now_ts = time.time()
+                is_ip_limit = (reg_code == -2) or (reg_code == -1 and curp and recent_ip_until.get(curp, 0) > now_ts)
+                busy = (reg_code == -1) or (reg_code == 10010008) or ('username' in reg_msg.lower() and ('unavailable' in reg_msg.lower() or 'exists' in reg_msg.lower() or 'exist' in reg_msg.lower()))
+                if is_ip_limit:
+                    # помечаем прокси и ротируем, имя не меняем
+                    if curp:
+                        ip_limit_marked.add(curp)
+                        recent_ip_until[curp] = now_ts + 15.0
+                    try:
+                        self.log.emit(f"{Icons.WARNING} [PP] Пометка прокси как 'Register IP Limit' (code={reg_code}). Смена прокси...")
+                    except Exception:
+                        pass
+                    # Закрываем предыдущую HTTP-сессию перед ротацией
+                    try:
+                        if api is not None:
+                            sess = getattr(api, 'session', None)
+                            if sess is not None:
+                                sess.close()
+                            try:
+                                self._live_apis.discard(api)
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                    curp = current_proxy()
+                    if not curp:
+                        break
+                    api = PPPokerAPI(proxy=curp)
+                    try:
+                        api.session.get('https://www.pppoker.club/', proxies=api.proxies, timeout=10)
+                    except Exception:
+                        pass
+                    time.sleep(self._rand_delay())
+                    continue
+                hard = (reg_code in (10000044, 20010029, -999))
+                if busy and attempt < max_username_retries:
                     old = username
                     username = gen.generate_login(min_len=6, max_len=16)
-                    self.log.emit(f"{Icons.WARNING} [PP] Имя отклонено (code={reg_code}), новая попытка: {old} → {username} ({attempt}/{max_username_retries})")
+                    attempt += 1
+                    self.log.emit(f"{Icons.WARNING} [PP] Имя занято (code={reg_code}). Новая попытка: {old} → {username} ({attempt}/{max_username_retries})")
                     time.sleep(self._rand_delay())
+                    continue
+                # сетевые/жёсткие ошибки → ротация прокси, username не меняем
+                if hard and net_retry < max_net_retries:
+                    try:
+                        from core.api import mask_proxy_for_log as _mask
+                        self.log.emit(f"{Icons.WARNING} [PP] Сетевая/лимит-IP ошибка (code={reg_code} msg={reg_msg}). Смена прокси...")
+                    except Exception:
+                        pass
+                    # Закрываем предыдущую HTTP-сессию перед ротацией
+                    try:
+                        if api is not None:
+                            sess = getattr(api, 'session', None)
+                            if sess is not None:
+                                sess.close()
+                            try:
+                                self._live_apis.discard(api)
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                    curp = current_proxy()
+                    api = PPPokerAPI(proxy=curp)
+                    try:
+                        api.session.get('https://www.pppoker.club/', proxies=api.proxies, timeout=10)
+                    except Exception:
+                        pass
+                    net_retry += 1
+                    time.sleep(self._rand_delay())
+                    continue
+                # иначе — окончательный отказ
+                break
             if not reg_ok:
                 self.log.emit(f"{Icons.ERROR} [PP] Регистрация отклонена окончательно")
                 fail_total += 1; processed_total += 1
@@ -732,43 +967,74 @@ class Worker(QThread):
                 time.sleep(self._rand_delay())
                 continue
             uid = api.get_uid_from_login_response(data)
-            # Avatar via HTTP per-account
+            # Avatar via HTTP per-account (2 retries, 7s interval)
             if change_avatar and avatar_path and uid:
-                try:
-                    url = self._ppp_upload_avatar(api, int(uid), avatar_path)
-                    if url:
-                        self.log.emit(f"{Icons.INFO} [PP] Аватар загружен: {url}")
-                    else:
-                        self.log.emit(f"{Icons.WARNING} [PP] Аватар не загружен")
-                except Exception as e:
-                    self.log.emit(f"{Icons.WARNING} [PP] Ошибка загрузки аватара: {e}")
-            # TCP change name
-            if change_nick and uid and api.token:
-                try:
-                    from pppoker.client import PPPokerTCPClient
-                    host = getattr(api, 'tcp_host', None) or 'ali-entry.pppoker.club'
-                    port = int(getattr(api, 'tcp_port', None) or 4000)
-                    tcp = PPPokerTCPClient(host=host, port=port, timeout=5.0, proxy=api.proxy_url)
+                max_avatar_attempts = 3  # 1 try + 2 retries
+                last_err = None
+                url = None
+                for att in range(1, max_avatar_attempts + 1):
                     try:
-                        tcp.clientver = getattr(api, 'client_version', '4.2.41')
-                    except Exception:
-                        pass
-                    try:
-                        tcp.connect()
-                        ok_login, msg = tcp.tcp_login(uid=int(uid), token=api.token, clientip='', entry_host=host, entry_port=port)
-                        if not ok_login:
-                            raise RuntimeError(f"tcp_login: {msg}")
-                        okn, rsp = tcp.change_username(nickname=nick)
-                        self.log.emit(f"{Icons.INFO} [PP] Смена ника [{username}] → '{nick}': {'успех' if okn else rsp}")
+                        url = self._ppp_upload_avatar(api, int(uid), avatar_path)
+                        if url:
+                            self.log.emit(f"{Icons.INFO} [PP] Аватар загружен: {url}")
+                            break
                     except Exception as e:
-                        self.log.emit(f"{Icons.WARNING} [PP] TCP изменение профиля: {e}")
-                    finally:
+                        last_err = e
+                    if att < max_avatar_attempts:
                         try:
-                            tcp.close()
+                            self.log.emit(f"{Icons.WARNING} [PP] Аватар: повторная попытка {att+1}/{max_avatar_attempts} через 7с")
                         except Exception:
                             pass
-                except Exception as e:
-                    self.log.emit(f"{Icons.WARNING} [PP] TCP клиент недоступен: {e}")
+                        time.sleep(7)
+                if not url:
+                    if last_err:
+                        self.log.emit(f"{Icons.WARNING} [PP] Аватар не загружен после {max_avatar_attempts} попыток: {last_err}")
+                    else:
+                        self.log.emit(f"{Icons.WARNING} [PP] Аватар не загружен после {max_avatar_attempts} попыток")
+            # TCP change name (2 retries, 7s interval)
+            if change_nick and uid and api.token:
+                max_nick_attempts = 3
+                okn = False
+                last_msg = ''
+                for att in range(1, max_nick_attempts + 1):
+                    try:
+                        from pppoker.client import PPPokerTCPClient
+                        host = getattr(api, 'tcp_host', None) or 'ali-entry.pppoker.club'
+                        port = int(getattr(api, 'tcp_port', None) or 4000)
+                        tcp = PPPokerTCPClient(host=host, port=port, timeout=5.0, proxy=api.proxy_url)
+                        try:
+                            tcp.clientver = getattr(api, 'client_version', '4.2.41')
+                        except Exception:
+                            pass
+                        try:
+                            tcp.connect()
+                            ok_login, msg = tcp.tcp_login(uid=int(uid), token=api.token, clientip='', entry_host=host, entry_port=port)
+                            if not ok_login:
+                                last_msg = f"tcp_login: {msg}"
+                            else:
+                                okn, rsp = tcp.change_username(nickname=nick)
+                                if okn:
+                                    self.log.emit(f"{Icons.INFO} [PP] Смена ника [{username}] → '{nick}': успех")
+                                    break
+                                else:
+                                    last_msg = str(rsp)
+                        except Exception as e:
+                            last_msg = str(e)
+                        finally:
+                            try:
+                                tcp.close()
+                            except Exception:
+                                pass
+                    except Exception as e:
+                        last_msg = str(e)
+                    if not okn and att < max_nick_attempts:
+                        try:
+                            self.log.emit(f"{Icons.WARNING} [PP] Смена ника: повторная попытка {att+1}/{max_nick_attempts} через 7с ({last_msg})")
+                        except Exception:
+                            pass
+                        time.sleep(7)
+                if not okn:
+                    self.log.emit(f"{Icons.WARNING} [PP] Смена ника не удалась после {max_nick_attempts} попыток: {last_msg}")
             # Emit account
             acc = Account(username=username, password=password, device_id=imei)
             acc.proxy = api.proxy_url
@@ -800,6 +1066,18 @@ class Worker(QThread):
                 pass
             success_total += 1
             processed_total += 1
+            # Закрываем HTTP-сессию по окончании итерации
+            try:
+                if api is not None:
+                    sess = getattr(api, 'session', None)
+                    if sess is not None:
+                        sess.close()
+                    try:
+                        self._live_apis.discard(api)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
             time.sleep(self._rand_delay())
         # Закроем CSV
         try:
@@ -889,12 +1167,17 @@ class Worker(QThread):
                 return
             gen = CredGenerator(words_file=words_file)
             proxy_idx = 0
+            ip_limit_local: Set[str] = set()
             def current_proxy() -> Optional[str]:
                 nonlocal proxy_idx
                 if not pgroup:
                     return reg_proxy
-                p = pgroup[proxy_idx % len(pgroup)]; proxy_idx+=1
-                return p
+                # find next proxy in pgroup not marked IP-limit
+                for _ in range(max(1, len(pgroup))):
+                    p = pgroup[proxy_idx % len(pgroup)]; proxy_idx += 1
+                    if p not in ip_limit_local:
+                        return p
+                return None
             while not self._stop:
                 try:
                     token = q.get_nowait()
@@ -912,22 +1195,57 @@ class Worker(QThread):
                     nick = gen.derive_nick(username, min_len=6, max_len=20)
                     password = gen.generate_password(min_len=6, max_len=16)
                     imei = self._ppp_imei40(str(uuid.uuid4()))
-                    api = PPPokerAPI(proxy=current_proxy())
+                    api = None
+                    curp = current_proxy()
+                    api = PPPokerAPI(proxy=curp)
+                    # preflight cookie (aliyungf_tc)
+                    try:
+                        api.session.get('https://www.pppoker.club/', proxies=api.proxies, timeout=10)
+                    except Exception:
+                        pass
                     # explicit register + login
                     reg_ok = False
                     max_username_retries = 4
+                    max_net_retries = 6
                     attempt = 0
+                    net_retry = 0
                     while attempt <= max_username_retries and not reg_ok:
+                        reg_code = -999
+                        reg_msg = ''
                         try:
                             reg_rsp = api.register(username=username, password=password, device_id=imei)
                             reg_code = int(reg_rsp.get('code', -1)) if isinstance(reg_rsp, dict) else -1
-                        except Exception:
+                            reg_msg = str(reg_rsp.get('msg','')) if isinstance(reg_rsp, dict) else ''
+                        except Exception as e:
                             reg_code = -999
+                            reg_msg = str(e)
                         if reg_code == 0:
                             reg_ok = True
                             break
-                        attempt += 1
-                        if attempt <= max_username_retries:
+                        now_ts = time.time()
+                        is_ip_limit = (reg_code == -2) or (reg_code == -1 and curp and False)  # recent window handled via local mark
+                        # treat -1 as username busy by default
+                        busy = (reg_code == -1) or (reg_code == 10010008) or ('username' in reg_msg.lower() and ('unavailable' in reg_msg.lower() or 'exists' in reg_msg.lower() or 'exist' in reg_msg.lower()))
+                        if is_ip_limit:
+                            if curp:
+                                ip_limit_local.add(curp)
+                            try:
+                                self.log.emit(f"{Icons.WARNING} [T{wi}] Пометка прокси как 'Register IP Limit' (code={reg_code}). Смена прокси...")
+                            except Exception:
+                                pass
+                            # rotate proxy
+                            curp = current_proxy()
+                            # recreate API on new proxy
+                            api = PPPokerAPI(proxy=curp)
+                            try:
+                                api.session.get('https://www.pppoker.club/', proxies=api.proxies, timeout=10)
+                            except Exception:
+                                pass
+                            net_retry += 1
+                            time.sleep(self._rand_delay())
+                            continue
+                        hard = (reg_code in (10000044, 20010029, -999))
+                        if busy and attempt < max_username_retries:
                             old = username
                             # reserve new username
                             while True:
@@ -937,8 +1255,37 @@ class Worker(QThread):
                                         usernames_global.add(cand)
                                         break
                             username = cand
-                            self.log.emit(f"{Icons.WARNING} [T{wi}] Имя отклонено (code={reg_code}), новая попытка: {old} → {username} ({attempt}/{max_username_retries})")
+                            attempt += 1
+                            self.log.emit(f"{Icons.WARNING} [T{wi}] Имя занято (code={reg_code}), новая попытка: {old} → {username} ({attempt}/{max_username_retries})")
                             time.sleep(self._rand_delay())
+                            continue
+                        if hard and net_retry < max_net_retries:
+                            try:
+                                self.log.emit(f"{Icons.WARNING} [T{wi}] Сетевая/лимит-IP ошибка (code={reg_code} msg={reg_msg}). Смена прокси...")
+                            except Exception:
+                                pass
+                            # Закрываем предыдущую HTTP-сессию перед ротацией
+                            try:
+                                if api is not None:
+                                    sess = getattr(api, 'session', None)
+                                    if sess is not None:
+                                        sess.close()
+                                    try:
+                                        self._live_apis.discard(api)
+                                    except Exception:
+                                        pass
+                            except Exception:
+                                pass
+                            curp = current_proxy()
+                            api = PPPokerAPI(proxy=curp)
+                            try:
+                                api.session.get('https://www.pppoker.club/', proxies=api.proxies, timeout=10)
+                            except Exception:
+                                pass
+                            net_retry += 1
+                            time.sleep(self._rand_delay())
+                            continue
+                        break
                     if not reg_ok:
                         self.log.emit(f"{Icons.ERROR} [T{wi}] Регистрация отклонена окончательно")
                         with counts_lock:
@@ -956,31 +1303,63 @@ class Worker(QThread):
                         q.task_done();
                         continue
                     uid = self.api_class().get_uid_from_login_response(data)
-                    # avatar
+                    # avatar (2 retries, 7s interval)
                     if change_avatar and avatar_path and uid:
-                        try:
-                            url = self._ppp_upload_avatar(api, int(uid), avatar_path)
-                            if url:
-                                self.log.emit(f"{Icons.INFO} [T{wi}] Аватар загружен: {url}")
-                        except Exception:
-                            pass
-                    # nick via TCP
-                    if change_nick and uid and api.token:
-                        try:
-                            host = getattr(api, 'tcp_host', None) or 'ali-entry.pppoker.club'
-                            port = int(getattr(api, 'tcp_port', None) or 4000)
-                            tcp = PPPokerTCPClient(host=host, port=port, timeout=5.0, proxy=api.proxy_url)
+                        max_avatar_attempts = 3
+                        last_err = None
+                        url = None
+                        for att in range(1, max_avatar_attempts + 1):
                             try:
-                                tcp.clientver = getattr(api, 'client_version', '4.2.41')
-                            except Exception:
-                                pass
-                            tcp.connect(); ok_login, msg = tcp.tcp_login(uid=int(uid), token=api.token, clientip='', entry_host=host, entry_port=port)
-                            if ok_login:
-                                okn, rsp = tcp.change_username(nickname=nick)
-                                self.log.emit(f"{Icons.INFO} [T{wi}] Смена ника [{username}] → '{nick}': {'успех' if okn else rsp}")
-                            tcp.close()
-                        except Exception as e:
-                            self.log.emit(f"{Icons.WARNING} [T{wi}] TCP профайл: {e}")
+                                url = self._ppp_upload_avatar(api, int(uid), avatar_path)
+                                if url:
+                                    self.log.emit(f"{Icons.INFO} [T{wi}] Аватар загружен: {url}")
+                                    break
+                            except Exception as e:
+                                last_err = e
+                            if att < max_avatar_attempts:
+                                try:
+                                    self.log.emit(f"{Icons.WARNING} [T{wi}] Аватар: повторная попытка {att+1}/{max_avatar_attempts} через 7с")
+                                except Exception:
+                                    pass
+                                time.sleep(7)
+                        if not url and last_err:
+                            self.log.emit(f"{Icons.WARNING} [T{wi}] Аватар не загружен после {max_avatar_attempts} попыток: {last_err}")
+                    # nick via TCP (2 retries, 7s interval)
+                    if change_nick and uid and api.token:
+                        max_nick_attempts = 3
+                        okn = False
+                        last_msg = ''
+                        for att in range(1, max_nick_attempts + 1):
+                            try:
+                                host = getattr(api, 'tcp_host', None) or 'ali-entry.pppoker.club'
+                                port = int(getattr(api, 'tcp_port', None) or 4000)
+                                tcp = PPPokerTCPClient(host=host, port=port, timeout=5.0, proxy=api.proxy_url)
+                                try:
+                                    tcp.clientver = getattr(api, 'client_version', '4.2.41')
+                                except Exception:
+                                    pass
+                                tcp.connect(); ok_login, msg = tcp.tcp_login(uid=int(uid), token=api.token, clientip='', entry_host=host, entry_port=port)
+                                if ok_login:
+                                    okn, rsp = tcp.change_username(nickname=nick)
+                                    if okn:
+                                        self.log.emit(f"{Icons.INFO} [T{wi}] Смена ника [{username}] → '{nick}': успех")
+                                        tcp.close()
+                                        break
+                                    else:
+                                        last_msg = str(rsp)
+                                else:
+                                    last_msg = f"tcp_login: {msg}"
+                                tcp.close()
+                            except Exception as e:
+                                last_msg = str(e)
+                            if not okn and att < max_nick_attempts:
+                                try:
+                                    self.log.emit(f"{Icons.WARNING} [T{wi}] Смена ника: повторная попытка {att+1}/{max_nick_attempts} через 7с ({last_msg})")
+                                except Exception:
+                                    pass
+                                time.sleep(7)
+                        if not okn:
+                            self.log.emit(f"{Icons.WARNING} [T{wi}] Смена ника не удалась после {max_nick_attempts} попыток: {last_msg}")
                     acc = Account(username=username, password=password, device_id=imei)
                     acc.proxy = api.proxy_url; acc.token = api.token; acc.uid = int(uid) if uid else None; acc.last_login_at = time.time()
                     try:
@@ -1012,6 +1391,18 @@ class Worker(QThread):
                 except Exception as e:
                     self.log.emit(f"{Icons.ERROR} [T{wi}] Ошибка регистрации: {e}")
                 finally:
+                    # Закрываем HTTP-сессию по окончании обработки задачи
+                    try:
+                        if api is not None:
+                            sess = getattr(api, 'session', None)
+                            if sess is not None:
+                                sess.close()
+                            try:
+                                self._live_apis.discard(api)
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
                     try:
                         q.task_done()
                     except Exception:
@@ -1172,6 +1563,7 @@ class Worker(QThread):
             if self._stop:
                 finished_cause = "Остановлено пользователем"
                 break
+            api = None
             try:
                 # Генерируем логин/ник/пароль (логин можно ретраить при 10010008)
                 username = gen.generate_login(min_len=8, max_len=16)
@@ -1239,6 +1631,18 @@ class Worker(QThread):
                             pass
                         if proxy_count > 0:
                             rotate_proxy(msg)
+                            # Закрываем предыдущую HTTP-сессию перед ротацией
+                            try:
+                                if api is not None:
+                                    sess = getattr(api, 'session', None)
+                                    if sess is not None:
+                                        sess.close()
+                                    try:
+                                        self._live_apis.discard(api)
+                                    except Exception:
+                                        pass
+                            except Exception:
+                                pass
                             api = self.api_class(proxy=current_proxy())
                             try:
                                 self._live_apis.add(api)
@@ -1266,6 +1670,18 @@ class Worker(QThread):
                                 pass
                             if proxy_count > 0:
                                 rotate_proxy(f"{msg}")
+                                # Закрываем предыдущую HTTP-сессию перед ротацией
+                                try:
+                                    if api is not None:
+                                        sess = getattr(api, 'session', None)
+                                        if sess is not None:
+                                            sess.close()
+                                        try:
+                                            self._live_apis.discard(api)
+                                        except Exception:
+                                            pass
+                                except Exception:
+                                    pass
                                 api = self.api_class(proxy=current_proxy())
                                 try:
                                     self._live_apis.add(api)
@@ -1314,6 +1730,18 @@ class Worker(QThread):
                         if curp is None:
                             self.log.emit(f"{Icons.WARNING} Все прокси помечены как 'Register IP Limit' — прекращаем попытку")
                             break
+                        # Закрываем предыдущую HTTP-сессию перед ротацией
+                        try:
+                            if api is not None:
+                                sess = getattr(api, 'session', None)
+                                if sess is not None:
+                                    sess.close()
+                                try:
+                                    self._live_apis.discard(api)
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
                         api = self.api_class(proxy=curp)
                         rotated += 1
                         time.sleep(self._rand_delay())
@@ -1376,8 +1804,8 @@ class Worker(QThread):
                                 avatar_url = None
                         if not avatar_url:
                             self.log.emit(f"{Icons.INFO} Смена аватара [{username}]: пропущено (нет URL)")
-                    # Ретраи TCP: до 3 попыток, с ротацией endpoint'ов
-                    max_attempts = max(1, min(3, 1 + len(endpoints)))
+                    # Ретраи TCP: ровно 3 попытки (1 + 2 ретрая), 7с пауза, с ротацией endpoint'ов
+                    max_attempts = 3
                     ok_name = (not change_nick)
                     ok_av = (not change_avatar) or (avatar_url is None)
                     for attempt_n in range(1, max_attempts+1):
@@ -1447,7 +1875,7 @@ class Worker(QThread):
                             except Exception:
                                 pass
                         # Пауза между повторами
-                        time.sleep(self._rand_delay())
+                        time.sleep(7)
                     if not (ok_name and ok_av):
                         self.log.emit(f"{Icons.WARNING} Не удалось полностью применить TCP-изменения для [{username}] (ник={'ok' if ok_name else 'fail'}, аватар={'ok' if ok_av else 'fail'})")
                 # Создаём Account и отдаём в UI
@@ -1478,6 +1906,19 @@ class Worker(QThread):
                 processed_total += 1
             except Exception as e:
                 self.log.emit(f"{Icons.ERROR} Ошибка на шаге регистрации: {e}")
+            finally:
+                # Закрываем HTTP-сессию (если создавалась) по окончании итерации
+                try:
+                    if api is not None:
+                        sess = getattr(api, 'session', None)
+                        if sess is not None:
+                            sess.close()
+                        try:
+                            self._live_apis.discard(api)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
             time.sleep(self._rand_delay())
         try:
             if regs_file:
@@ -1675,6 +2116,7 @@ class Worker(QThread):
                 except queue.Empty:
                     break
                 requeue_token = False
+                api = None
                 try:
                     # Сначала резервируем уникальное имя глобально
                     while True:
@@ -1703,6 +2145,7 @@ class Worker(QThread):
                         requeue_token = True
                         break
                     api = self.api_class(proxy=curp)
+
                     try:
                         self._live_apis.add(api)
                     except Exception:
@@ -1735,6 +2178,18 @@ class Worker(QThread):
                             if proxy_count>0:
                                 rotate_proxy_local(msg)
                                 curp = current_proxy()
+                                # Закрываем предыдущую HTTP-сессию перед ротацией
+                                try:
+                                    if api is not None:
+                                        sess = getattr(api, 'session', None)
+                                        if sess is not None:
+                                            sess.close()
+                                        try:
+                                            self._live_apis.discard(api)
+                                        except Exception:
+                                            pass
+                                except Exception:
+                                    pass
                                 api = self.api_class(proxy=curp)
                                 try:
                                     self._live_apis.add(api)
@@ -1756,6 +2211,18 @@ class Worker(QThread):
                                 if proxy_count>0:
                                     rotate_proxy_local(msg)
                                     curp = current_proxy()
+                                    # Закрываем предыдущую HTTP-сессию перед ротацией
+                                    try:
+                                        if api is not None:
+                                            sess = getattr(api, 'session', None)
+                                            if sess is not None:
+                                                sess.close()
+                                            try:
+                                                self._live_apis.discard(api)
+                                            except Exception:
+                                                pass
+                                    except Exception:
+                                        pass
                                     api = self.api_class(proxy=curp)
                                     try:
                                         self._live_apis.add(api)
@@ -1809,6 +2276,18 @@ class Worker(QThread):
                                 requeue_token = True
                                 self.log.emit(f"{Icons.WARNING} [T{worker_idx}] Все прокси помечены как 'Register IP Limit' — задача будет передана другим потокам")
                                 break
+                            # Закрываем предыдущую HTTP-сессию перед ротацией
+                            try:
+                                if api is not None:
+                                    sess = getattr(api, 'session', None)
+                                    if sess is not None:
+                                        sess.close()
+                                    try:
+                                        self._live_apis.discard(api)
+                                    except Exception:
+                                        pass
+                            except Exception:
+                                pass
                             api = self.api_class(proxy=curp)
                             rotated += 1
                             time.sleep(self._rand_delay())
@@ -1946,6 +2425,18 @@ class Worker(QThread):
                     done_local += 1
                     q.task_done()
                 finally:
+                    # Закрываем HTTP-сессию по окончании обработки задачи
+                    try:
+                        if api is not None:
+                            sess = getattr(api, 'session', None)
+                            if sess is not None:
+                                sess.close()
+                            try:
+                                self._live_apis.discard(api)
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
                     if requeue_token:
                         try:
                             q.put(token)
@@ -2588,6 +3079,9 @@ class PPPokerTab(QWidget):
         knobs.addWidget(QLabel("Задержка макс (мс):"))
         self.spn_delay_max = QSpinBox(); self.spn_delay_max.setRange(0, 20000); self.spn_delay_max.setValue(1500)
         knobs.addWidget(self.spn_delay_max)
+        knobs.addWidget(QLabel("Параллельно (TCP):"))
+        self.spn_join_threads = QSpinBox(); self.spn_join_threads.setRange(1, 1000); self.spn_join_threads.setValue(64)
+        knobs.addWidget(self.spn_join_threads)
         self.chk_shuffle = QCheckBox("Перемешать ID клубов"); self.chk_shuffle.setChecked(True)
         knobs.addWidget(self.chk_shuffle)
         v.addLayout(knobs)
@@ -2971,7 +3465,7 @@ class PPPokerTab(QWidget):
         if dmax < dmin:
             dmin, dmax = dmax, dmin
         message_text = self.txt_message.text().strip()
-        self.worker.set_task(self.worker.task_join_round, clubs_to_process, limit, dmin, dmax, message_text)
+        self.worker.set_task(self.worker.task_join_round, clubs_to_process, limit, dmin, dmax, message_text, int(self.spn_join_threads.value()))
         self.worker.start()
 
     def on_pause(self):
@@ -3006,6 +3500,18 @@ class PPPokerTab(QWidget):
             self.btn_logout.setEnabled(True)
         except Exception:
             pass
+        # Сброс прогресса после завершения задачи (оставляем полосу видимой)
+        try:
+            if hasattr(self, 'status_progress'):
+                self._progress_mode = ""
+                self._progress_total = 0
+                self._progress_done = 0
+                self._progress_seen = set()
+                self.status_progress.setRange(0, 1)
+                self.status_progress.setValue(0)
+                self.status_progress.setFormat("Готово")
+        except Exception:
+            pass
 
     def on_generate_accounts(self):
         # Диалог как в XPoker
@@ -3016,7 +3522,7 @@ class PPPokerTab(QWidget):
         def_threads = getattr(self, 'reg_threads_last', 1)
         def_ppt = getattr(self, 'reg_ppt_last', 0)
         def_avatar_path = getattr(self, 'reg_avatar_path_last', '')
-        dlg = GenerateAccountsDialog(default_count=100, default_proxies_text=default_proxies_text, default_dmin=dmin, default_dmax=dmax, default_set_avatar=def_set_avatar, default_threads=def_threads, default_ppt=def_ppt, default_avatar_path=def_avatar_path, parent=self)
+        dlg = GenerateAccountsDialog(default_count=int(getattr(self, 'reg_count_last', 100)), default_proxies_text=default_proxies_text, default_dmin=dmin, default_dmax=dmax, default_set_avatar=def_set_avatar, default_threads=def_threads, default_ppt=def_ppt, default_avatar_path=def_avatar_path, parent=self)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
         cnt, proxies_list, delay_min_ms, delay_max_ms, set_avatar, threads, ppt, avatar_path = dlg.get_values()
@@ -3025,6 +3531,7 @@ class PPPokerTab(QWidget):
         if self.worker.isRunning():
             QMessageBox.information(self, "Занято", "Процесс уже выполняется"); return
         # Сохраняем последние параметры
+        self.reg_count_last = int(cnt)
         self.reg_proxies_last = "\n".join(proxies_list)
         self.reg_delay_min_last = int(delay_min_ms)
         self.reg_delay_max_last = int(delay_max_ms)
@@ -3118,12 +3625,14 @@ class PPPokerTab(QWidget):
                 'refresh_token_expire': acc.refresh_token_expire,
             } for acc in self.accounts],
             'club_ids': self.club_ids,
-            'settings': {
+'settings': {
                 'clubs_per_account': self.spn_clubs_per_account.value(),
                 'delay_min_ms': self.spn_delay_min.value(),
                 'delay_max_ms': self.spn_delay_max.value(),
                 'shuffle_clubs': self.chk_shuffle.isChecked(),
                 'apply_message': self.txt_message.text(),
+                'join_threads': int(self.spn_join_threads.value()),
+                'reg_count': int(getattr(self, 'reg_count_last', 100)),
                 'reg_proxies': getattr(self, 'reg_proxies_last', ''),
                 'reg_delay_min_ms': int(getattr(self, 'reg_delay_min_last', 400)),
                 'reg_delay_max_ms': int(getattr(self, 'reg_delay_max_last', 900)),
@@ -3174,7 +3683,12 @@ class PPPokerTab(QWidget):
             self.spn_delay_max.setValue(ui.get('delay_max_ms', 1500))
             self.chk_shuffle.setChecked(ui.get('shuffle_clubs', True))
             self.txt_message.setText(ui.get('apply_message',''))
+            try:
+                self.spn_join_threads.setValue(int(ui.get('join_threads', 64)))
+            except Exception:
+                pass
             # restore last reg params
+            self.reg_count_last = int(ui.get('reg_count', 100))
             self.reg_proxies_last = ui.get('reg_proxies','')
             self.reg_delay_min_last = int(ui.get('reg_delay_min_ms', 400))
             self.reg_delay_max_last = int(ui.get('reg_delay_max_ms', 900))
@@ -3288,6 +3802,9 @@ class MainWindow(QMainWindow):
         knobs.addWidget(QLabel("Задержка макс (мс):"))
         self.spn_delay_max = QSpinBox(); self.spn_delay_max.setRange(0, 20000); self.spn_delay_max.setValue(1500)
         knobs.addWidget(self.spn_delay_max)
+        knobs.addWidget(QLabel("Параллельно (TCP):"))
+        self.spn_join_threads = QSpinBox(); self.spn_join_threads.setRange(1, 1000); self.spn_join_threads.setValue(64)
+        knobs.addWidget(self.spn_join_threads)
         self.chk_shuffle = QCheckBox("Перемешать ID клубов")
         self.chk_shuffle.setChecked(True)
         knobs.addWidget(self.chk_shuffle)
@@ -3396,6 +3913,27 @@ class MainWindow(QMainWindow):
             try:
                 sb.addPermanentWidget(QLabel("Тема:"))
                 sb.addPermanentWidget(self.cmb_theme)
+            except Exception:
+                pass
+            # Глобальная полоса прогресса (всегда видима, слева)
+            try:
+                self._progress_total = 0
+                self._progress_done = 0
+                self._progress_mode = ""  # 'login' | 'join' | 'register' | ''
+                self._progress_seen = set()  # для режима 'login'
+                self.status_progress = QProgressBar()
+                self.status_progress.setRange(0, 1)
+                self.status_progress.setValue(0)
+                self.status_progress.setTextVisible(True)
+                self.status_progress.setFixedWidth(390)
+                self.status_progress.setFormat("Готово")
+                # Обёртка с отступами слева/справа
+                _prog_wrap = QWidget()
+                _prog_lay = QHBoxLayout(_prog_wrap)
+                _prog_lay.setContentsMargins(12, 0, 8, 0)
+                _prog_lay.setSpacing(0)
+                _prog_lay.addWidget(self.status_progress)
+                sb.addWidget(_prog_wrap, 0)
             except Exception:
                 pass
             ver_lbl = QLabel(f"Версия: {__version__}")
@@ -3563,15 +4101,29 @@ class MainWindow(QMainWindow):
         def_threads = getattr(self, 'reg_threads_last', 1)
         def_ppt = getattr(self, 'reg_ppt_last', 0)
         def_avatar_path = getattr(self, 'reg_avatar_path_last', '')
-        dlg = GenerateAccountsDialog(default_count=100, default_proxies_text=default_proxies_text, default_dmin=dmin, default_dmax=dmax, default_set_avatar=def_set_avatar, default_threads=def_threads, default_ppt=def_ppt, default_avatar_path=def_avatar_path, parent=self)
+        dlg = GenerateAccountsDialog(default_count=int(getattr(self, 'reg_count_last', 100)), default_proxies_text=default_proxies_text, default_dmin=dmin, default_dmax=dmax, default_set_avatar=def_set_avatar, default_threads=def_threads, default_ppt=def_ppt, default_avatar_path=def_avatar_path, parent=self)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
         cnt, proxies_list, delay_min_ms, delay_max_ms, set_avatar, threads, ppt, avatar_path = dlg.get_values()
+        # Глобальный прогресс: регистрация X/Y
+        try:
+            self._progress_mode = "register"
+            self._progress_total = int(cnt)
+            self._progress_done = 0
+            if self._progress_total <= 0:
+                self._progress_total = 1
+            self.status_progress.setRange(0, self._progress_total)
+            self.status_progress.setValue(0)
+            self.status_progress.setFormat(f"Регистрация 0/{self._progress_total}")
+            self.status_progress.show()
+        except Exception:
+            pass
         if cnt <= 0:
             return
         if self.worker.isRunning():
             QMessageBox.information(self, "Занято", "Процесс уже выполняется"); return
         # Сохраняем последние параметры
+        self.reg_count_last = int(cnt)
         self.reg_proxies_last = "\n".join(proxies_list)
         self.reg_delay_min_last = int(delay_min_ms)
         self.reg_delay_max_last = int(delay_max_ms)
@@ -3589,6 +4141,17 @@ class MainWindow(QMainWindow):
 
     def on_new_account(self, acc: Account):
         """Обработчик добавления нового аккаунта (после успешной регистрации)."""
+        # Обновляем глобальный прогресс для регистрации
+        try:
+            if getattr(self, '_progress_mode', '') == 'register' and hasattr(self, 'status_progress'):
+                self._progress_done = int(self._progress_done) + 1
+                total = max(1, int(self._progress_total))
+                done = min(int(self._progress_done), total)
+                self.status_progress.setRange(0, total)
+                self.status_progress.setValue(done)
+                self.status_progress.setFormat(f"Регистрация {done}/{total}")
+        except Exception:
+            pass
         try:
             self.accounts.append(acc)
             self._append_account_row(acc)
@@ -3606,6 +4169,18 @@ class MainWindow(QMainWindow):
         if self.worker.isRunning():
             QMessageBox.information(self, "Занято", "Процесс уже выполняется")
             return
+        # Прогресс: вход X/Y
+        try:
+            self._progress_mode = "login"
+            self._progress_total = len(self.accounts)
+            self._progress_done = 0
+            self._progress_seen = set()
+            total = max(1, int(self._progress_total))
+            self.status_progress.setRange(0, total)
+            self.status_progress.setValue(0)
+            self.status_progress.setFormat(f"Вход 0/{total}")
+        except Exception:
+            pass
         self.worker.set_task(self.worker.task_login_all)
         self.worker.start()
 
@@ -3647,7 +4222,20 @@ class MainWindow(QMainWindow):
             dmin, dmax = dmax, dmin
         # Текст сообщения (ограничен виджетом до 41 символа)
         message_text = self.txt_message.text().strip()
-        self.worker.set_task(self.worker.task_join_round, clubs_to_process, limit, dmin, dmax, message_text)
+        # Глобальный прогресс: заявки X/Y
+        try:
+            self._progress_mode = "join"
+            self._progress_total = len(clubs_to_process)
+            self._progress_done = 0
+            if self._progress_total <= 0:
+                self._progress_total = 1
+            self.status_progress.setRange(0, int(self._progress_total))
+            self.status_progress.setValue(0)
+            self.status_progress.setFormat(f"Заявки 0/{int(self._progress_total)}")
+            self.status_progress.show()
+        except Exception:
+            pass
+        self.worker.set_task(self.worker.task_join_round, clubs_to_process, limit, dmin, dmax, message_text, int(self.spn_join_threads.value()))
         self.worker.start()
 
     def on_debug_tcp(self):
@@ -3955,6 +4543,24 @@ class MainWindow(QMainWindow):
 
     def on_account_updated(self, row: int, data: list):
         # Обновление строки из бэкэнда — без триггера сохранения
+        # Обновим глобальный прогресс для режима 'login'
+        try:
+            if getattr(self, '_progress_mode', '') == 'login' and hasattr(self, 'status_progress'):
+                uname = None
+                try:
+                    uname = str(data[0]) if isinstance(data, list) and len(data) > 0 else None
+                except Exception:
+                    uname = None
+                if uname and uname not in self._progress_seen:
+                    self._progress_seen.add(uname)
+                    self._progress_done = int(self._progress_done) + 1
+                    total = max(1, int(self._progress_total))
+                    done = min(int(self._progress_done), total)
+                    self.status_progress.setRange(0, total)
+                    self.status_progress.setValue(done)
+                    self.status_progress.setFormat(f"Вход {done}/{total}")
+        except Exception:
+            pass
         self._suppress_item_changed = True
         try:
             for col, val in enumerate(data):
@@ -3976,6 +4582,17 @@ class MainWindow(QMainWindow):
     def on_join_result(self, jr: JoinResult):
         # Сохраняем объект JoinResult напрямую, преобразование в словарь делаем при экспорте
         self.report_rows.append(jr)
+        # Обновляем глобальный прогресс (XPoker)
+        try:
+            if getattr(self, '_progress_mode', '') == 'join' and hasattr(self, 'status_progress'):
+                self._progress_done = int(self._progress_done) + 1
+                total = max(1, int(self._progress_total))
+                done = min(int(self._progress_done), total)
+                self.status_progress.setRange(0, total)
+                self.status_progress.setValue(done)
+                self.status_progress.setFormat(f"Заявки {done}/{total}")
+        except Exception:
+            pass
 
     def _append_account_row(self, acc: Account):
         r = self.tbl.rowCount()
@@ -4174,13 +4791,15 @@ class MainWindow(QMainWindow):
                 'refresh_token_expire': acc.refresh_token_expire,
             } for acc in self.accounts],
             'club_ids': self.club_ids,
-            'settings': {
+'settings': {
                 'clubs_per_account': self.spn_clubs_per_account.value(),
                 'delay_min_ms': self.spn_delay_min.value(),
                 'delay_max_ms': self.spn_delay_max.value(),
                 'shuffle_clubs': self.chk_shuffle.isChecked(),
                 'apply_message': self.txt_message.text(),
+                'join_threads': int(self.spn_join_threads.value()),
                 'theme': getattr(self, 'theme_pref', 'system'),
+                'reg_count': int(getattr(self, 'reg_count_last', 100)),
                 'reg_proxies': getattr(self, 'reg_proxies_last', ''),
                 'reg_delay_min_ms': int(getattr(self, 'reg_delay_min_last', 400)),
                 'reg_delay_max_ms': int(getattr(self, 'reg_delay_max_last', 900)),
@@ -4257,11 +4876,16 @@ class MainWindow(QMainWindow):
             self.spn_delay_min.setValue(ui_settings.get('delay_min_ms', 500))
             self.spn_delay_max.setValue(ui_settings.get('delay_max_ms', 1500))
             self.chk_shuffle.setChecked(ui_settings.get('shuffle_clubs', True))
+            try:
+                self.spn_join_threads.setValue(int(ui_settings.get('join_threads', 64)))
+            except Exception:
+                pass
             # Сообщение заявки
             self.txt_message.setText(ui_settings.get('apply_message', ''))
             # Тема (установить выбор и применить)
             theme_mode = ui_settings.get('theme', 'system')
             # Последние параметры генерации
+            self.reg_count_last = int(ui_settings.get('reg_count', 100))
             self.reg_proxies_last = ui_settings.get('reg_proxies','') or ui_settings.get('reg_proxy','') or ''
             self.reg_delay_min_last = int(ui_settings.get('reg_delay_min_ms', 400))
             self.reg_delay_max_last = int(ui_settings.get('reg_delay_max_ms', 900))
