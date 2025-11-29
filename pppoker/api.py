@@ -17,6 +17,9 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 BASE_URL = "https://www.pppoker.club"
 LOGIN_PATH = "/poker/api/login.php"
 CLIENT_VER = "4.2.41"
+# Unity PC client headers observed in captures
+UNITY_UA = "UnityPlayer/2022.3.43f1 (UnityWebRequest/1.0, libcurl/8.5.0-DEV)"
+UNITY_VER = "2022.3.43f1"
 
 
 class ApiError(Exception):
@@ -228,7 +231,19 @@ class PPPokerAPI:
             'clientvar': self.client_version,
             'app_type': '1',
         }
-        r = self.session.get(url, params=params, proxies=self.proxies, timeout=self.timeout)
+        # Unity-like headers as in the official PC client capture
+        headers = {
+            'User-Agent': UNITY_UA,
+            'Accept': '*/*',
+            'Accept-Encoding': 'deflate, gzip',
+            'X-Unity-Version': UNITY_VER,
+        }
+        # Prefetch root to obtain cookies like aliyungf_tc
+        try:
+            self.session.get(BASE_URL + '/', headers=headers, proxies=self.proxies, timeout=min(10, self.timeout))
+        except Exception:
+            pass
+        r = self.session.get(url, params=params, headers=headers, proxies=self.proxies, timeout=self.timeout)
         r.raise_for_status()
         try:
             j = r.json()
