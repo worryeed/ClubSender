@@ -21,8 +21,10 @@ from .proxy_utils import normalize_proxy_input
 from .constants import (
     DEFAULT_BASE_URL, LOGIN_PATH, REGISTER_PATH, LOGOUT_PATH,
     JOIN_CLUB_PATH, SEARCH_CLUB_PATH, REFRESH_PATH,
+    AVAILABLE_PATH, CAPTCHA_REG_CODE_PATH, MAX_CAPTCHA_RETRIES,
     DEFAULT_HEARTBEAT_INTERVAL, XPOKER_CLIENT_VERSION,
 )
+from .captcha_solver import solve_captcha_b64, CaptchaSolveError
 from .client import XClubTCPClient
 from .messages import Icons, decode_club_apply_status, format_tcp_step
 
@@ -582,6 +584,67 @@ mobile_profile: bool = True,
             
         return data
 
+    def check_available(
+        self,
+        username: str,
+        device_id: str,
+        app_level: int = 0,
+    ) -> bool:
+        """Check if a username is available for registration.
+
+        Returns True if username is available (code==0), False otherwise.
+        """
+        payload = {
+            "username": username,
+            "appLevel": app_level,
+            "deviceId": device_id,
+        }
+        ts = int(time.time())
+        sign = generate_sign(payload, ts, AVAILABLE_PATH)
+        params = {"timestamp": str(ts), "sign": sign}
+        log.info(f"Проверка доступности ника '{username}'")
+        data = self._request("POST", AVAILABLE_PATH, params=params, json_body=payload, auth_token=None)
+        code = data.get("code", -1) if isinstance(data, dict) else -1
+        if code == 0:
+            log.info(f"Ник '{username}' свободен")
+            return True
+        msg = data.get("msg", "") if isinstance(data, dict) else ""
+        log.warning(f"Ник '{username}' недоступен: code={code} msg={msg}")
+        return False
+
+    def request_captcha(
+        self,
+        device_id: str,
+        app_level: int = 0,
+    ) -> tuple[str, str]:
+        """Request a registration captcha image.
+
+        Returns (image_base64, captcha_key).
+        Raises ApiError if the request fails.
+        """
+        payload = {
+            "appLevel": app_level,
+            "deviceId": device_id,
+        }
+        ts = int(time.time())
+        sign = generate_sign(payload, ts, CAPTCHA_REG_CODE_PATH)
+        params = {"timestamp": str(ts), "sign": sign}
+        log.info("Запрос капчи для регистрации")
+        data = self._request("POST", CAPTCHA_REG_CODE_PATH, params=params, json_body=payload, auth_token=None)
+        code = data.get("code", -1) if isinstance(data, dict) else -1
+        if code != 0:
+            msg = data.get("msg", "") if isinstance(data, dict) else ""
+            raise ApiError(f"Ошибка запроса капчи: code={code} msg={msg}")
+        captcha_data = data.get("data", {})
+        img_b64 = captcha_data.get("img")
+        captcha_key = captcha_data.get("key")
+        if not img_b64:
+            raise ApiError(f"Сервер не вернул изображение капчи (data keys: {list(captcha_data.keys())})")
+        if not captcha_key:
+            raise ApiError(f"Сервер не вернул ключ капчи (data keys: {list(captcha_data.keys())})")
+        log.info(f"Капча получена: image={len(img_b64)} chars, key={captcha_key[:30]}...")
+        return img_b64, captcha_key
+
     def register(
         self,
         *,
@@ -596,10 +659,16 @@ mobile_profile: bool = True,
         device_token: str = "",
         country: str = "UnKnown",
     ) -> Dict[str, Any]:
-        """Register a new X-Poker account and try to capture tokens/TCP entry.
+        """Register a new X-Poker account with automatic captcha solving.
 
-        The registration payload mirrors login fields and uses the same double MD5
-        password scheme and timestamp/sign generation.
+        Flow:
+          1. Request captcha from /api/common/captcha/regCode
+          2. Solve captcha with ddddocr
+          3. Submit registration with captcha answer
+          4. If captcha wrong — retry (up to MAX_CAPTCHA_RETRIES attempts)
+
+        The registration payload uses double MD5 password and timestamp/sign.
+        On success, tokens and TCP entries are extracted from the response.
         """
         if self.mobile_profile:
             try:
@@ -609,26 +678,91 @@ mobile_profile: bool = True,
                     device = "android"
             except Exception:
                 pass
-        payload = {
-            "timezoneId": timezone_id,
-            "appLevel": app_level,
-            "os": os_code,
-            "device": device,
-            "deviceId": device_id,
-            "lang": lang,
-            "username": username,
-            "password": double_md5(password),
-            "deviceToken": device_token,
-            "country": country,
-        }
+
         # keep last device_id for potential refresh
         self.device_id = device_id
-        ts = int(time.time())
-        sign = generate_sign(payload, ts, REGISTER_PATH)
-        params = {"timestamp": str(ts), "sign": sign}
-        log.debug(f"Registration attempt for {username}")
-        data = self._request("POST", REGISTER_PATH, params=params, json_body=payload, auth_token=None)
-        # Try to extract token/refresh/entry similar to login
+        password_hash = double_md5(password)
+
+        last_data: Dict[str, Any] = {}
+
+        for attempt in range(1, MAX_CAPTCHA_RETRIES + 1):
+            # --- Step 1: Request captcha ---
+            try:
+                img_b64, captcha_key = self.request_captcha(device_id, app_level)
+            except (ApiError, Exception) as e:
+                log.error(f"Ошибка получения капчи (попытка {attempt}/{MAX_CAPTCHA_RETRIES}): {e}")
+                if attempt < MAX_CAPTCHA_RETRIES:
+                    import time as _time
+                    _time.sleep(1)
+                    continue
+                raise ApiError(f"Не удалось получить капчу после {MAX_CAPTCHA_RETRIES} попыток: {e}")
+
+            # --- Step 2: Solve captcha ---
+            try:
+                captcha_text = solve_captcha_b64(img_b64, save_debug=True)
+            except CaptchaSolveError as e:
+                log.error(f"Ошибка решения капчи (попытка {attempt}/{MAX_CAPTCHA_RETRIES}): {e}")
+                if attempt < MAX_CAPTCHA_RETRIES:
+                    continue
+                raise ApiError(f"Не удалось решить капчу после {MAX_CAPTCHA_RETRIES} попыток: {e}")
+
+            # Validate: server requires at least 4 chars
+            if len(captcha_text) < 4:
+                log.warning(f"Капча слишком короткая: '{captcha_text}' ({len(captcha_text)} chars < 4). Запрашиваем новую (попытка {attempt}/{MAX_CAPTCHA_RETRIES})")
+                if attempt < MAX_CAPTCHA_RETRIES:
+                    continue
+                raise ApiError(f"Капча не решена: ddddocr возвращает слишком короткие ответы")
+
+            # --- Step 3: Register with captcha ---
+            payload = {
+                "timezoneId": timezone_id,
+                "captcha": captcha_text,
+                "captchaKey": captcha_key,
+                "appLevel": app_level,
+                "password": password_hash,
+                "country": country,
+                "lang": lang,
+                "deviceId": device_id,
+                "os": os_code,
+                "device": device,
+                "username": username,
+                "deviceToken": device_token,
+            }
+            ts = int(time.time())
+            sign = generate_sign(payload, ts, REGISTER_PATH)
+            params = {"timestamp": str(ts), "sign": sign}
+            log.info(f"Регистрация '{username}' с капчей='{captcha_text}' (попытка {attempt}/{MAX_CAPTCHA_RETRIES})")
+            data = self._request("POST", REGISTER_PATH, params=params, json_body=payload, auth_token=None)
+            last_data = data
+
+            code = data.get("code", -1) if isinstance(data, dict) else -1
+            msg = str(data.get("msg", "")) if isinstance(data, dict) else ""
+
+            # --- Step 4: Check result ---
+            if code == 0:
+                log.info(f"Регистрация '{username}' успешна!")
+                break
+
+            # Check if captcha-related error -> retry
+            is_captcha_error = (
+                "captcha" in msg.lower()
+                or "验证" in msg.lower()
+                or code == 10000003
+            )
+            if is_captcha_error:
+                log.warning(f"Ошибка капчи: code={code} msg={msg}. "
+                            f"{'Запрашиваем новую...' if attempt < MAX_CAPTCHA_RETRIES else 'Попытки исчерпаны'}")
+                if attempt < MAX_CAPTCHA_RETRIES:
+                    continue
+                # Return last failed data (caller handles error codes)
+                return last_data
+
+            # Non-captcha error — don't retry, return immediately
+            log.warning(f"Регистрация отклонена (не капча): code={code} msg={msg}")
+            return last_data
+
+        data = last_data
+        # Try to extract token/refresh/entry from successful response
         try:
             if isinstance(data, dict) and data.get("code") == 0:
                 # token container can be in data.auth or at top-level

@@ -1,3 +1,7 @@
+
+# Captcha test scripts
+tools/xpoker_captcha_reg/
+
 # Logs
 *.log
 *.out.log
