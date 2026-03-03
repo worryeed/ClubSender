@@ -30,11 +30,16 @@ htmlcov/
 build/
 dist/
 *.spec
+!ClubSender.spec
 *.bin
 *.zip
 *.7z
 *.tar
 *.tar.gz
+
+# Local probe scripts
+tools/*_probe.py
+tools/rth_preload_onnxruntime.py
 
 # OS junk
 .DS_Store

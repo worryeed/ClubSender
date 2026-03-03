@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import base64
 import logging
+import os
+import sys
 from pathlib import Path
 
 log = logging.getLogger(__name__)
@@ -16,6 +18,51 @@ log = logging.getLogger(__name__)
 class CaptchaSolveError(Exception):
     """Raised when captcha solving fails."""
     pass
+
+
+# Keep DLL directory handles alive (Windows / Python 3.8+)
+_dll_dir_handles: list[object] = []
+
+
+def _ensure_windows_dll_dirs():
+    """Ensure bundled DLL directories are visible when running from PyInstaller.
+
+    ddddocr -> onnxruntime loads native DLLs from onnxruntime/capi.
+    In onefile builds, those DLLs live under sys._MEIPASS and may not be on DLL search path.
+    """
+    if sys.platform != "win32":
+        return
+
+    meipass = getattr(sys, "_MEIPASS", None)
+    if not meipass:
+        return
+
+    # Add onnxruntime/capi for native libs.
+    cand_dirs = [
+        os.path.join(meipass, "onnxruntime", "capi"),
+    ]
+
+    for d in cand_dirs:
+        try:
+            if os.path.isdir(d):
+                # 1) Preferred: add directory to DLL search path
+                try:
+                    h = os.add_dll_directory(d)
+                    _dll_dir_handles.append(h)
+                    log.debug(f"[captcha] add_dll_directory: {d}")
+                except Exception as e:
+                    log.debug(f"[captcha] add_dll_directory failed for {d}: {e}")
+                # 2) Fallback: extend PATH (helps some LoadLibrary paths)
+                try:
+                    cur = os.environ.get("PATH", "")
+                    if d not in cur.split(";"):
+                        os.environ["PATH"] = d + ";" + cur
+                        log.debug(f"[captcha] PATH prepended: {d}")
+                except Exception as e:
+                    log.debug(f"[captcha] PATH update failed: {e}")
+        except Exception as e:
+            log.debug(f"[captcha] DLL dir setup error for {d}: {e}")
+            continue
 
 
 # Singleton OCR instance (heavy to create, reuse across calls)
@@ -27,11 +74,15 @@ def _get_ocr():
     global _ocr_instance
     if _ocr_instance is not None:
         return _ocr_instance
+
+    # PyInstaller(onefile) on Windows: ensure onnxruntime native DLLs can be found.
+    _ensure_windows_dll_dirs()
+
     try:
         import ddddocr
-    except ImportError:
+    except Exception as e:
         raise CaptchaSolveError(
-            "ddddocr не установлен. Выполните: pip install ddddocr==1.5.5"
+            f"ddddocr не удалось импортировать: {type(e).__name__}: {e}"
         )
     try:
         _ocr_instance = ddddocr.DdddOcr(show_ad=False)

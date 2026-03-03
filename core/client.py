@@ -106,6 +106,8 @@ class XClubTCPClient:
         # Reconnect/fallback endpoints and state
         self._fallback_endpoints: list[tuple[str, int]] = list(fallback_endpoints or [])
         self._reconnect_lock = threading.RLock()
+        # Serialize socket writes (heartbeat thread + main thread) to avoid interleaved frames.
+        self._send_lock = threading.Lock()
         # round-robin index for endpoint rotation across reconnects
         self._rr_index: int = 0
         # Stored auth context for autoreconnect
@@ -115,6 +117,10 @@ class XClubTCPClient:
         # Post-login bootstrap state
         self._bootstrap_done = threading.Event()
         self._disable_bootstrap = bool(disable_bootstrap)
+        # Profile-change warmup (send-only burst like official client)
+        self._profile_warmup_done = threading.Event()
+        # RLock to avoid deadlock if warmup triggers ensure_connected()->tcp_login()->warmup recursively
+        self._profile_warmup_lock = threading.RLock()
         # Strict bootstrap pacing (40–60ms by default)
         self._strict_pause_ms = max(1, int(strict_pause_ms))
         # Force seq=1 on all outgoing frames (default True in frida_strict mode)
@@ -376,27 +382,34 @@ class XClubTCPClient:
         if not self.connected:
             if not self.ensure_connected():
                 raise DisconnectedError("No TCP connection established")
-        # Capture socket reference atomically and re-validate
-        s = self.sock
-        if s is None:
-            raise DisconnectedError("No TCP socket available for send")
+        s: Optional[socket.socket] = None
         try:
-            frame_send(s, payload)
+            # Serialize writes so heartbeat + foreground requests can't interleave.
+            with self._send_lock:
+                s = self.sock
+                if s is None:
+                    raise DisconnectedError("No TCP socket available for send")
+                frame_send(s, payload)
         except Exception as e:
             log.debug(f"Frame send failed: {e}")
-            # mark disconnected and cleanup
+            # mark disconnected and cleanup (only the socket we tried to use)
             try:
-                self._connected = False
-                if self.sock:
+                with self._send_lock:
+                    if self.sock is s:
+                        self._connected = False
+                        self.sock = None
+            except Exception:
+                pass
+            try:
+                if s:
                     try:
-                        self.sock.shutdown(socket.SHUT_RDWR)
+                        s.shutdown(socket.SHUT_RDWR)
                     except Exception:
                         pass
                     try:
-                        self.sock.close()
+                        s.close()
                     except Exception:
                         pass
-                    self.sock = None
             except Exception:
                 pass
             raise
@@ -407,27 +420,34 @@ class XClubTCPClient:
         if not self.connected:
             if not self.ensure_connected():
                 raise DisconnectedError("No TCP connection established")
-        # Capture socket reference atomically and re-validate
-        s = self.sock
-        if s is None:
-            raise DisconnectedError("No TCP socket available for send")
+        s: Optional[socket.socket] = None
         try:
-            s.sendall(packet)
+            # Serialize writes so heartbeat + foreground requests can't interleave.
+            with self._send_lock:
+                s = self.sock
+                if s is None:
+                    raise DisconnectedError("No TCP socket available for send")
+                s.sendall(packet)
         except Exception as e:
             log.debug(f"Send failed: {e}")
-            # mark disconnected and cleanup
+            # mark disconnected and cleanup (only the socket we tried to use)
             try:
-                self._connected = False
-                if self.sock:
+                with self._send_lock:
+                    if self.sock is s:
+                        self._connected = False
+                        self.sock = None
+            except Exception:
+                pass
+            try:
+                if s:
                     try:
-                        self.sock.shutdown(socket.SHUT_RDWR)
+                        s.shutdown(socket.SHUT_RDWR)
                     except Exception:
                         pass
                     try:
-                        self.sock.close()
+                        s.close()
                     except Exception:
                         pass
-                    self.sock = None
             except Exception:
                 pass
             raise
@@ -715,6 +735,94 @@ class XClubTCPClient:
                 pass
         self._safe_sendall(packet)
 
+    def _send_cmd_send_only(self, msg_type: str, msg_type_id: int, protobuf_payload: bytes) -> None:
+        """Send a command packet without waiting for a response (pump will still receive/store RSPs)."""
+        from .protocol import build_packet_correct
+        seq = self._next_sequence()
+        packet = build_packet_correct(msg_type, msg_type_id, protobuf_payload, seq)
+        # Ensure pump is running so responses are captured
+        if not (self._pump_thread and self._pump_thread.is_alive()):
+            try:
+                self.start_pump()
+            except Exception:
+                pass
+        if self.debug_wire or self.log_tx_hex:
+            try:
+                content_len = len(packet) - 4 if len(packet) >= 4 else len(packet)
+                log.info(f"TX: {msg_type} type=0x{msg_type_id:04x} seq={seq} len={content_len} hex={packet.hex()}")
+            except Exception:
+                pass
+        self._safe_sendall(packet)
+
+    def _warmup_profile_changes_send_only(self) -> None:
+        """Send an official-like post-login burst so the server keeps the session alive.
+
+        Observed in tcp.txt: immediately after UserLoginRSP the client sends HBREQ and then a set of
+        GetSelfData/GetMoney/RiskManage/UserCustomize/SelfGamesInfo/Appearance/etc requests.
+
+        This implementation is SEND-ONLY (no blocking waits) and should be safe to run even when
+        disable_bootstrap=True.
+        """
+        if not self._logged_in:
+            return
+        if self._profile_warmup_done.is_set():
+            return
+        with self._profile_warmup_lock:
+            if self._profile_warmup_done.is_set():
+                return
+            try:
+                from .constants import MSG_TYPE_IDS as _IDS
+                from .protocol import build_packet_correct as _build
+
+                # Ensure pump is running so responses are captured
+                if not (self._pump_thread and self._pump_thread.is_alive()):
+                    try:
+                        self.start_pump()
+                    except Exception:
+                        pass
+
+                log.info("🧊 Warmup: sending post-login burst for profile changes (send-only)")
+
+                # Build the burst as a single send (closer to official client behavior / PCAP dumps)
+                packets: list[bytes] = []
+
+                def add(msg_type: str, msg_type_id: int, pb: bytes) -> None:
+                    try:
+                        seq = self._next_sequence()
+                        packets.append(_build(msg_type, msg_type_id, pb, seq))
+                    except Exception:
+                        pass
+
+                # Core warmup sequence (no waits)
+                add("pk.GetSelfDataREQ", _IDS["GetSelfDataREQ"], b"")
+
+                # GetMoney variants: payload 0x18 <val>
+                add("pk.GetMoneyREQ", _IDS["GetMoneyREQ"], bytes([0x18, 0x01]))
+                add("pk.GetMoneyREQ", _IDS["GetMoneyREQ"], bytes([0x18, 0x02]))
+                add("pk.GetMoneyREQ", _IDS["GetMoneyREQ"], bytes([0x18, 0x09]))
+                add("pk.GetMoneyREQ", _IDS["GetMoneyREQ"], bytes([0x18, 0x0a]))
+
+                add("pk.GetRiskManageDetailREQ", _IDS["GetRiskManageDetailREQ"], b"")
+                add("pk.GetUserCustomizeREQ", _IDS["GetUserCustomizeREQ"], b"")
+                add("pk.GetSelfGamesInfoREQ", _IDS["GetSelfGamesInfoREQ"], b"")
+
+                # AppearanceSystemData (param 08 03) as seen in logs
+                add("pk.GetAppearanceSystemDataREQ", _IDS["GetAppearanceSystemDataREQ"], bytes([0x08, 0x03]))
+
+                # Additional lightweight requests seen in the official trace
+                add("pk.FetchNewUserNDayRewardREQ", _IDS["FetchNewUserNDayRewardREQ"], b"")
+                add("pk.GetCollectHandListREQ", _IDS["GetCollectHandListREQ"], b"")
+                add("pk.GetClubDescListREQ", _IDS["GetClubDescListREQ"], b"")
+                add("pk.GetWaitingListDetailREQ", _IDS["GetWaitingListDetailREQ"], b"")
+
+                if packets:
+                    self._safe_sendall(b"".join(packets))
+            finally:
+                try:
+                    self._profile_warmup_done.set()
+                except Exception:
+                    pass
+
     def send_cmd_and_wait(self, msg_type: str, msg_type_id: int, protobuf_payload: bytes, expected_cmd: str, timeout: float) -> Optional[bytes]:
         from .protocol import build_packet_correct
         seq = self._next_sequence()
@@ -746,6 +854,11 @@ class XClubTCPClient:
             Response payload
         """
         log.info(f"TCP login for uid={uid}")
+        # new session -> warmup should run again
+        try:
+            self._profile_warmup_done.clear()
+        except Exception:
+            pass
         # store auth context for autoreconnect
         try:
             self._uid = int(uid)
@@ -786,6 +899,25 @@ class XClubTCPClient:
         
         # Check if login successful
         if MSG_USER_LOGIN_RSP.encode() in response:
+            # Parse login status if possible (field2 usually contains status)
+            status = None
+            uid_rsp = None
+            try:
+                from .protobuf_decoder import find_payload_start, parse_protobuf_fields
+                start = find_payload_start(response)
+                if start >= 0:
+                    fields = parse_protobuf_fields(response[start:])
+                    if 1 in fields and fields[1]:
+                        uid_rsp = fields[1][0]
+                    if 2 in fields and fields[2]:
+                        status = fields[2][0]
+            except Exception:
+                pass
+
+            if status not in (None, 0):
+                log.warning(f"TCP login got UserLoginRSP but status={status} uid={uid_rsp}")
+                return response
+
             log.info("TCP login successful")
             # Инициализируем счётчик после успешного логина
             self.sequence_counter = 1
@@ -796,13 +928,31 @@ class XClubTCPClient:
                 self.start_pump()
             except Exception as e:
                 log.debug(f"Failed to start message pump after login: {e}")
-            
-            # В строгом режиме: выполняем bootstrap СИНХРОННО и не запускаем фоновый heartbeat до его завершения
+
+            # Send a single immediate HBREQ like the official client (unless strict bootstrap will do it).
             try:
-                if getattr(self, "_frida_strict", False):
+                if getattr(self, "_disable_bootstrap", False) or not getattr(self, "_frida_strict", False):
+                    self._send_heartbeat_send_only()
+            except Exception:
+                pass
+
+            # В строгом режиме: выполняем bootstrap СИНХРОННО и не запускаем фоновый heartbeat до его завершения.
+            # При disable_bootstrap=True — НЕ делаем блокирующий bootstrap, но делаем send-only warmup burst,
+            # иначе сервер часто закрывает соединение ~через 1-2 секунды и ChangeName/ChangeAvatar не успевают.
+            try:
+                if getattr(self, "_disable_bootstrap", False):
+                    try:
+                        self._bootstrap_done.set()
+                    except Exception:
+                        pass
+                    try:
+                        self._warmup_profile_changes_send_only()
+                    except Exception as e:
+                        log.debug(f"Warmup burst error: {e}")
+                elif getattr(self, "_frida_strict", False):
                     log.info("🔒 Running strict FRIDA bootstrap synchronously (no heartbeat thread during bootstrap)")
                     self.run_frida_strict_bootstrap()
-                elif not getattr(self, "_disable_bootstrap", False):
+                else:
                     # Нестрогий режим: прежний фоновый bootstrap
                     self._start_post_login_bootstrap()
             except Exception as e:
@@ -895,6 +1045,11 @@ class XClubTCPClient:
         """
         if not self._logged_in:
             return False, "Not logged in"
+        # Some servers require a post-login warmup burst; otherwise they close the session quickly.
+        try:
+            self._warmup_profile_changes_send_only()
+        except Exception:
+            pass
         try:
             from .constants import MSG_TYPE_IDS as _IDS
             from .protocol import varint_encode as _venc
@@ -932,6 +1087,11 @@ class XClubTCPClient:
         """
         if not self._logged_in:
             return False, "Not logged in"
+        # Some servers require a post-login warmup burst; otherwise they close the session quickly.
+        try:
+            self._warmup_profile_changes_send_only()
+        except Exception:
+            pass
         try:
             from .constants import MSG_TYPE_IDS as _IDS
             from .protocol import varint_encode as _venc
@@ -1405,7 +1565,6 @@ class XClubTCPClient:
                 # Добавляем джиттер ± 50ms согласно инструкции
                 jitter = random.uniform(-0.05, 0.05)  # ± 50ms
                 actual_interval = max(0.2, interval + jitter)
-                
                 if self._stop_heartbeat.wait(actual_interval):
                     break  # Остановились
                 try:
