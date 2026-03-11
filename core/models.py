@@ -26,7 +26,7 @@ class Account:
         """Convert account to table row for GUI display."""
         return [
             self.username,
-            "******",
+            self.password,
             self.proxy or "",
             self.device_id or "",
             self.token[:10] + "..." if self.token else "",
@@ -58,7 +58,8 @@ class JoinResult:
         elif self.ok:
             msg = "Клуб есть"
         else:
-            not_found_markers = ("не существует", "клуб не найден", "club not found")
+            # маркеры отсутствия клуба (для разных протоколов/локализаций)
+            not_found_markers = ("не существует", "клуб не найден", "клуба нет", "club not found")
             if any(p in low for p in not_found_markers):
                 msg = "Клуба нет"
             else:

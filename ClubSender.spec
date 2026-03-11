@@ -45,6 +45,11 @@ a = Analysis(
         'PIL',
         'PIL.Image',
         'cv2',
+        # FishPoker integration (dynamic imports in main.py)
+        'fishpoker',
+        'fishpoker.api',
+        'fishpoker.client',
+        'fishpoker.protocol',
     ],
     hookspath=[],
     hooksconfig={},

@@ -158,7 +158,44 @@ class Worker(QThread):
     def _wait_if_paused(self):
         """Задержка выполнения, пока установлена пауза (или до остановки)."""
         while self._pause and not self._stop:
-            time.sleep(0.2)
+            try:
+                # ждём небольшими шагами, чтобы stop() срабатывал мгновенно
+                if hasattr(self, "_cancel_event") and self._cancel_event is not None:
+                    self._cancel_event.wait(timeout=0.2)
+                else:
+                    time.sleep(0.2)
+            except Exception:
+                time.sleep(0.2)
+
+    def _sleep(self, seconds: float, *, granularity: float = 0.1) -> None:
+        """Ожидание с быстрым выходом при stop()/cancel_event и с уважением к паузе."""
+        try:
+            seconds_f = float(seconds)
+        except Exception:
+            return
+        if seconds_f <= 0:
+            return
+        end = time.time() + seconds_f
+        while (not self._stop) and time.time() < end:
+            # если поставили паузу — ждём снятия
+            self._wait_if_paused()
+            if self._stop:
+                break
+            remain = end - time.time()
+            if remain <= 0:
+                break
+            chunk = min(float(granularity), remain)
+            try:
+                if hasattr(self, "_cancel_event") and self._cancel_event is not None:
+                    if self._cancel_event.wait(timeout=chunk):
+                        break
+                else:
+                    time.sleep(chunk)
+            except Exception:
+                try:
+                    time.sleep(chunk)
+                except Exception:
+                    break
 
     def run(self):
         if not self._task:
@@ -173,9 +210,16 @@ class Worker(QThread):
         self._args = args
 
     def task_login_all(self):
-        # Сброс стопа/отмены
+        # Сброс стопа/паузы/отмены
         try:
             self._stop = False
+            # новая задача не должна стартовать в состоянии паузы
+            if getattr(self, "_pause", False):
+                self._pause = False
+                try:
+                    self.pause_changed.emit(False)
+                except Exception:
+                    pass
             if hasattr(self, "_cancel_event"):
                 self._cancel_event.clear()
         except Exception:
@@ -192,6 +236,25 @@ class Worker(QThread):
         processed = 0
         ok_cnt = 0
         fail_cnt = 0
+
+        def _is_transient_login_error(err: Exception) -> bool:
+            s = str(err).lower()
+            return (
+                ("remotedisconnected" in s)
+                or ("remote end closed connection without response" in s)
+                or ("connection aborted" in s)
+                or ("connection reset" in s)
+                or ("connection refused" in s)
+                or ("read timed out" in s)
+                or ("connect timeout" in s)
+                or ("timed out" in s)
+                or ("proxyerror" in s)
+                or ("max retries exceeded" in s)
+                or ("service unavailable" in s)
+                or ("bad gateway" in s)
+                or ("gateway timeout" in s)
+            )
+
         def group_worker(proxy_key: Optional[str], indices: list[int]):
             nonlocal processed, ok_cnt, fail_cnt
             for idx in indices:
@@ -199,66 +262,114 @@ class Worker(QThread):
                     break
                 acc = self.accounts[idx]
                 local_success = False
+                api = None
+                data = None
                 try:
                     proxy_info = acc.proxy or 'без прокси'
                     self.log.emit(f"{Icons.AUTH} [{acc.username}] Авторизация через {proxy_info}")
-                    api = self.api_class(proxy=acc.proxy)
-                    try:
-                        self._live_apis.add(api)
-                    except Exception:
-                        pass
-                    # Генерируем device_id если отсутствует
+                    # Генерируем device_id если отсутствует (один раз на аккаунт)
                     if not acc.device_id:
                         import uuid
                         acc.device_id = str(uuid.uuid4())
                         self.log.emit(f"{Icons.INFO} [{acc.username}] Сгенерирован device_id: {acc.device_id[:8]}...")
-                    data = api.login(
-                        username=acc.username,
-                        password=acc.password,
-                        device_id=acc.device_id
-                    )
-                    token = api.token
-                    acc.token = token
-                    local_success = bool(token)
-                    # Сохраняем refresh token если есть
-                    acc.refresh_token = api.refresh_token
-                    acc.access_token_expire = api.access_token_expire
-                    acc.refresh_token_expire = api.refresh_token_expire
-                    # Try to extract UID from login response
-                    uid = api.get_uid_from_login_response(data)
-                    if uid:
-                        acc.uid = uid
-                        self.log.emit(format_login_step(acc.username, "UID получен", True, f"uid={uid}"))
-                    else:
-                        if acc.username.startswith("XP"):
+
+                    max_attempts = 3
+                    for attempt_n in range(1, max_attempts + 1):
+                        if self._stop:
+                            break
+                        self._wait_if_paused()
+                        api = self.api_class(proxy=acc.proxy)
+                        try:
+                            self._live_apis.add(api)
+                        except Exception:
+                            pass
+                        try:
+                            data = api.login(
+                                username=acc.username,
+                                password=acc.password,
+                                device_id=acc.device_id
+                            )
+                            token = api.token
+                            acc.token = token
+                            local_success = bool(token)
+                            # Сохраняем refresh token если есть
+                            acc.refresh_token = api.refresh_token
+                            acc.access_token_expire = api.access_token_expire
+                            acc.refresh_token_expire = api.refresh_token_expire
+                            # Сохраняем служебные данные (TCP endpoints / version / client_ip) в extra
                             try:
-                                acc.uid = int(acc.username[2:])
-                                self.log.emit(format_login_step(acc.username, "UID получен из имени", True, f"uid={acc.uid}"))
+                                eps = getattr(api, 'tcp_entries', None) or getattr(api, 'tcp_endpoints', None)
+                                if eps:
+                                    acc.extra['tcp_entries'] = list(eps)
+                                cv = getattr(api, 'client_version', None)
+                                if cv:
+                                    acc.extra['client_version'] = str(cv)
+                                cip = getattr(api, 'client_ip', None) or getattr(api, 'clientip', None)
+                                if cip:
+                                    acc.extra['client_ip'] = str(cip)
                             except Exception:
-                                self.log.emit(format_login_step(acc.username, "UID не найден", False, "не удалось извлечь из имени пользователя"))
-                    acc.last_login_at = time.time()
-                    try:
-                        acc.headers = api.session.headers.copy()
-                    except Exception:
-                        acc.headers = {}
-                    self.account_updated.emit(idx, acc.as_row())
-                    # Понятный вывод причины, если токен не получен
-                    human = None
-                    try:
-                        if isinstance(data, dict):
-                            dcode = int(data.get('code', -1))
-                            dmsg = str(data.get('msg', '') or '').lower()
-                            if not token:
-                                if dcode == 10010042 or 'user ban' in dmsg:
-                                    human = 'аккаунт забанен (10010042)'
-                                elif dcode == 10000044 or 'accessdenied' in dmsg or 'access denied' in dmsg:
-                                    human = 'IP под угрозой — использование запрещено (10000044)'
-                    except Exception:
-                        pass
-                    if token:
-                        self.log.emit(format_login_step(acc.username, "Авторизация завершена", True, "токен получен"))
-                    else:
-                        self.log.emit(format_login_step(acc.username, "Авторизация завершена", False, human or "токен отсутствует"))
+                                pass
+                            # Try to extract UID from login response
+                            uid = api.get_uid_from_login_response(data)
+                            if uid:
+                                acc.uid = uid
+                                self.log.emit(format_login_step(acc.username, "UID получен", True, f"uid={uid}"))
+                            else:
+                                if acc.username.startswith("XP"):
+                                    try:
+                                        acc.uid = int(acc.username[2:])
+                                        self.log.emit(format_login_step(acc.username, "UID получен из имени", True, f"uid={acc.uid}"))
+                                    except Exception:
+                                        self.log.emit(format_login_step(acc.username, "UID не найден", False, "не удалось извлечь из имени пользователя"))
+                            acc.last_login_at = time.time()
+                            try:
+                                acc.headers = api.session.headers.copy()
+                            except Exception:
+                                acc.headers = {}
+                            self.account_updated.emit(idx, acc.as_row())
+                            # Понятный вывод причины, если токен не получен
+                            human = None
+                            try:
+                                if isinstance(data, dict):
+                                    dcode = int(data.get('code', -1))
+                                    dmsg = str(data.get('msg', '') or '').lower()
+                                    if not token:
+                                        if dcode == 10010042 or 'user ban' in dmsg:
+                                            human = 'аккаунт забанен (10010042)'
+                                        elif dcode == 10000044 or 'accessdenied' in dmsg or 'access denied' in dmsg:
+                                            human = 'IP под угрозой — использование запрещено (10000044)'
+                            except Exception:
+                                pass
+                            if token:
+                                self.log.emit(format_login_step(acc.username, "Авторизация завершена", True, "токен получен"))
+                            else:
+                                self.log.emit(format_login_step(acc.username, "Авторизация завершена", False, human or "токен отсутствует"))
+                            break
+                        except Exception as e:
+                            # stop requested — прекращаем без лишних логов/ретраев
+                            if self._stop:
+                                break
+                            if attempt_n < max_attempts and _is_transient_login_error(e):
+                                wait_s = 2.0 * attempt_n
+                                try:
+                                    self.log.emit(f"{Icons.WARNING} [{acc.username}] HTTP login: {e}. Повтор {attempt_n+1}/{max_attempts} через {int(wait_s)}с…")
+                                except Exception:
+                                    pass
+                                self._sleep(wait_s)
+                                continue
+                            raise
+                        finally:
+                            # Закрываем HTTP-сессию, чтобы не держать лишние дескрипторы/сокеты
+                            try:
+                                sess = getattr(api, 'session', None)
+                                if sess is not None:
+                                    sess.close()
+                            except Exception:
+                                pass
+                            try:
+                                self._live_apis.discard(api)
+                            except Exception:
+                                pass
                 except self.api_error_class as e:
                     self.log.emit(format_login_step(acc.username, "Ошибка API", False, str(e)))
                 except Exception as e:
@@ -282,7 +393,7 @@ class Worker(QThread):
                     except Exception:
                         pass
                 if not self._stop:
-                    time.sleep(self._rand_delay())
+                    self._sleep(self._rand_delay())
         for proxy_key, idxs in groups.items():
             t = threading.Thread(target=group_worker, args=(proxy_key, idxs), daemon=True)
             threads.append(t)
@@ -349,12 +460,18 @@ class Worker(QThread):
                             pass
                 except Exception:
                     pass
-            time.sleep(self._rand_delay())
+            self._sleep(self._rand_delay())
 
     def task_join_round(self, club_ids: List[str], clubs_per_account: int, delay_min_ms: int, delay_max_ms: int, message_text: Optional[str] = None, join_threads: int = 32):
-        # Сброс сигнала остановки и очистка события отмены перед стартом задачи
+        # Сброс сигнала остановки/паузы и очистка события отмены перед стартом задачи
         try:
             self._stop = False
+            if getattr(self, "_pause", False):
+                self._pause = False
+                try:
+                    self.pause_changed.emit(False)
+                except Exception:
+                    pass
             if hasattr(self, "_cancel_event"):
                 self._cancel_event.clear()
         except Exception:
@@ -437,10 +554,37 @@ class Worker(QThread):
         import threading, queue
         processed_clubs_lock = threading.Lock()
         processed_clubs_total = 0
-        # Агрегатор результатов по аккаунтам
+        # Агрегатор результатов по аккаунтам + сводные счётчики
         agg_lock = threading.Lock()
         agg_results: Dict[str, Dict[str, object]] = {}
-        
+        summary_lock = threading.Lock()
+        ok_total = 0
+        not_found_total = 0
+        send_fail_total = 0
+
+        def _is_not_found_msg(m: str) -> bool:
+            s = (m or "").lower()
+            return (
+                ("клуба нет" in s)
+                or ("клуб не найден" in s)
+                or ("не существует" in s)
+                or ("club not found" in s)
+            )
+
+        def _bump_summary(ok: bool, msg: str) -> None:
+            nonlocal ok_total, not_found_total, send_fail_total
+            try:
+                with summary_lock:
+                    if ok:
+                        ok_total += 1
+                    else:
+                        if _is_not_found_msg(msg):
+                            not_found_total += 1
+                        else:
+                            send_fail_total += 1
+            except Exception:
+                pass
+
         def account_worker(acc: Account, account_clubs: list[str]):
             nonlocal processed_clubs_total
             try:
@@ -455,6 +599,39 @@ class Worker(QThread):
                     pass
                 api.token = acc.token
                 api.refresh_token = acc.refresh_token
+                # Пробросим сохранённые служебные данные (если есть)
+                try:
+                    if getattr(acc, 'device_id', None) is not None and hasattr(api, 'device_id'):
+                        api.device_id = acc.device_id
+                    eps = None
+                    try:
+                        eps = (acc.extra or {}).get('tcp_entries')
+                    except Exception:
+                        eps = None
+                    if eps:
+                        if hasattr(api, 'tcp_entries'):
+                            api.tcp_entries = list(eps)
+                        if hasattr(api, 'tcp_endpoints'):
+                            api.tcp_endpoints = list(eps)
+                        if hasattr(api, 'tcp_host') and hasattr(api, 'tcp_port'):
+                            try:
+                                api.tcp_host, api.tcp_port = list(eps)[0]
+                            except Exception:
+                                pass
+                    try:
+                        cv = (acc.extra or {}).get('client_version')
+                        if cv and hasattr(api, 'client_version'):
+                            api.client_version = str(cv)
+                    except Exception:
+                        pass
+                    try:
+                        cip = (acc.extra or {}).get('client_ip')
+                        if cip and hasattr(api, 'client_ip'):
+                            api.client_ip = str(cip)
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
                 # Колбэк прогресса для остановки/паузы
                 def progress_cb(cid: int, idx: int, total: int) -> bool:
                     # Ожидание паузы
@@ -478,8 +655,15 @@ class Worker(QThread):
                     def _is_transient_tcp(m: str) -> bool:
                         s = m.lower()
                         return (
-                            ("no tcp connection" in s) or ("socket error" in s) or ("timed out" in s) or
-                            ("tcp_connect" in s) or ("tcp login" in s) or ("connect timeout" in s) or ("read timed out" in s)
+                            ("no tcp connection" in s)
+                            or ("socket error" in s)
+                            or ("timed out" in s)
+                            or ("tcp_connect" in s)
+                            or ("tcp_login" in s)
+                            or ("tcp login" in s)
+                            or ("userloginrsp" in s)
+                            or ("connect timeout" in s)
+                            or ("read timed out" in s)
                         )
                     # Если временная сетевая ошибка — сделаем 1 повтор через 10с для этого клуба
                     if not ok and _is_transient_tcp(low):
@@ -491,8 +675,7 @@ class Worker(QThread):
                         for _ in range(10):
                             if self._stop:
                                 return
-                            self._wait_if_paused()
-                            time.sleep(1.0)
+                            self._sleep(1.0)
                         # Повтор одной попыткой на отдельном TCP
                         ok2 = False; msg2 = msg
                         try:
@@ -508,11 +691,13 @@ class Worker(QThread):
                             self.join_result.emit(JoinResult(ts=time.time(), username=acc.username, club_id=str(cid), ok=ok2, message=msg2))
                             result_msg = format_join_result(acc.username, str(cid), ok2, msg2)
                             self.log.emit(result_msg)
-                            self.account_progress.emit(acc.username, done, total, ("✅ Клуб есть" if ok2 else "❌ Клуба нет"), str(cid))
+                            status_text = "✅ Клуб есть" if ok2 else ("❌ Клуба нет" if _is_not_found_msg(msg2) else "❌ Ошибка")
+                            self.account_progress.emit(acc.username, done, total, status_text, str(cid))
                         except Exception:
                             pass
                         with processed_clubs_lock:
                             processed_clubs_total += 1
+                        _bump_summary(bool(ok2), str(msg2 or ""))
                         # Агрегатор
                         try:
                             with agg_lock:
@@ -528,15 +713,17 @@ class Worker(QThread):
                         except Exception:
                             pass
                         if not self._stop:
-                            time.sleep(self._rand_delay())
+                            self._sleep(self._rand_delay())
                         return
                     # Обычная обработка (без повтора)
                     self.join_result.emit(JoinResult(ts=time.time(), username=acc.username, club_id=str(cid), ok=ok, message=msg))
                     result_msg = format_join_result(acc.username, str(cid), ok, msg)
                     self.log.emit(result_msg)
-                    self.account_progress.emit(acc.username, done, total, ("✅ Клуб есть" if ok else "❌ Клуба нет"), str(cid))
+                    status_text = "✅ Клуб есть" if ok else ("❌ Клуба нет" if _is_not_found_msg(msg) else "❌ Ошибка")
+                    self.account_progress.emit(acc.username, done, total, status_text, str(cid))
                     with processed_clubs_lock:
                         processed_clubs_total += 1
+                    _bump_summary(bool(ok), str(msg or ""))
                     # Сохраним для мини-отчёта
                     try:
                         with agg_lock:
@@ -552,7 +739,7 @@ class Worker(QThread):
                     except Exception:
                         pass
                     if not self._stop:
-                        time.sleep(self._rand_delay())
+                        self._sleep(self._rand_delay())
                 # Преобразуем ID клубов в int
                 club_ids_int: list[int] = []
                 for cid in account_clubs:
@@ -589,7 +776,7 @@ class Worker(QThread):
                                 for _ in range(10):
                                     if self._stop:
                                         break
-                                    self._wait_if_paused(); time.sleep(1.0)
+                                    self._sleep(1.0)
                                 attempt += 1
                                 continue
                             # Нетребуемая или повторная ошибка — пробрасываем
@@ -612,7 +799,8 @@ class Worker(QThread):
                 # Если result_cb уже отдал все, можно дополнительно финализировать статус
                 self.account_progress.emit(acc.username, len(results), len(club_ids_int), "🏁 Завершено", "-")
             except Exception as e:
-                self.log.emit(f"{Icons.ERROR} [{acc.username}] Ошибка обработки аккаунта: {e}")
+                if not self._stop:
+                    self.log.emit(f"{Icons.ERROR} [{acc.username}] Ошибка обработки аккаунта: {e}")
         
         # Пул потоков по заданиям (аккаунт + его клубы)
         job_q: "queue.Queue[tuple[Account, list[str]]]" = queue.Queue()
@@ -630,10 +818,11 @@ class Worker(QThread):
                 try:
                     account_worker(acc, acc_clubs)
                 except Exception as e:
-                    try:
-                        self.log.emit(f"{Icons.ERROR} [{acc.username}] Ошибка рабочего пула: {e}")
-                    except Exception:
-                        pass
+                    if not self._stop:
+                        try:
+                            self.log.emit(f"{Icons.ERROR} [{acc.username}] Ошибка рабочего пула: {e}")
+                        except Exception:
+                            pass
                 finally:
                     try:
                         job_q.task_done()
@@ -645,17 +834,33 @@ class Worker(QThread):
             t = threading.Thread(target=pool_worker, daemon=True)
             threads.append(t)
             t.start()
-        # Ждём завершения пула
+        # Ждём завершения пула (или остановки)
+        stop_deadline = 0.0
+        announced_wait = False
         while any(t.is_alive() for t in threads):
             if self._stop:
-                break
+                if not announced_wait:
+                    try:
+                        self.log.emit(f"{Icons.INFO} Ожидаем остановки рабочих потоков...")
+                    except Exception:
+                        pass
+                    announced_wait = True
+                    stop_deadline = time.time() + 6.0  # максимум 6с на корректное завершение
+                if time.time() > stop_deadline:
+                    break
             self._wait_if_paused()
-            time.sleep(0.1)
-        try:
-            job_q.join()
-        except Exception:
-            pass
-        self.task_finished.emit()
+            self._sleep(0.1)
+        # Точечно подождём каждый поток до 300мс, чтобы убрать хвосты логов
+        for t in threads:
+            try:
+                t.join(timeout=0.3)
+            except Exception:
+                pass
+        if not self._stop:
+            try:
+                job_q.join()
+            except Exception:
+                pass
         
         # Итоговый отчёт по вступлению
         planned_clubs = min(total_clubs_needed, len(club_ids))
@@ -675,7 +880,12 @@ class Worker(QThread):
                 finish_reason += f"; аккаунтов без клубов: {skipped}"
         except Exception:
             pass
-        self.log.emit(f"{icon} 🏁 Конец вступления: {finish_reason}. Прогресс: {processed_clubs_total}/{planned_clubs} (аккаунтов использовано: {assigned_accounts}/{len(authorized_accounts)})")
+        self.log.emit(
+            f"{icon} 🏁 Конец вступления: {finish_reason}. "
+            f"Прогресс: {processed_clubs_total}/{planned_clubs} "
+            f"(успешно: {ok_total}, клуба нет: {not_found_total}, ошибки: {send_fail_total}). "
+            f"Аккаунтов использовано: {assigned_accounts}/{len(authorized_accounts)}"
+        )
         self.task_finished.emit()
 
     def _rand_delay(self):
@@ -759,12 +969,824 @@ class Worker(QThread):
         except Exception:
             return None
 
+    # ===== FishPoker helpers =====
+    def _fp_gen_device_id(self, seed: Optional[str] = None) -> str:
+        """Generate a MAC-like device id (XX-XX-XX-XX-XX-XX)."""
+        try:
+            import hashlib
+            import secrets
+
+            if seed:
+                h = hashlib.md5(str(seed).encode('utf-8')).digest()
+                b = bytearray(h[:6])
+            else:
+                b = bytearray(secrets.token_bytes(6))
+            # locally administered, unicast
+            b[0] = (b[0] & 0xFE) | 0x02
+            return '-'.join(f"{x:02X}" for x in b)
+        except Exception:
+            return '02-00-00-00-00-01'
+
+    def _fp_upload_avatar(self, api, uid: int, image_path: str) -> Optional[str]:
+        try:
+            rdkey = getattr(api, 'token', '') or ''
+            if not rdkey:
+                return None
+            fn = getattr(api, 'upload_avatar', None)
+            if callable(fn):
+                return fn(uid=int(uid), rdkey=str(rdkey), image_path=str(image_path))
+            return None
+        except Exception:
+            return None
+
+    def task_register_fishpoker(self, count: int, change_nick: bool = True, change_avatar: bool = True, words_file: Optional[str] = None, reg_proxy: Optional[str] = None, delay_min_ms: int = 400, delay_max_ms: int = 900, proxies: Optional[List[str]] = None, avatar_path: Optional[str] = None):
+        """Регистрация FishPoker: HTTP register -> HTTP login -> (опц.) upload avatar -> (опц.) TCP change nick."""
+        try:
+            self._stop = False
+            if getattr(self, "_pause", False):
+                self._pause = False
+                try:
+                    self.pause_changed.emit(False)
+                except Exception:
+                    pass
+            if hasattr(self, "_cancel_event"):
+                self._cancel_event.clear()
+        except Exception:
+            pass
+        # jitter
+        try:
+            a = int(delay_min_ms); b = int(delay_max_ms)
+            if b < a: a, b = b, a
+            self.jitter_ms = (max(0, a), max(0, b))
+        except Exception:
+            self.jitter_ms = (400, 900)
+        # generator
+        try:
+            from core.credgen import CredGenerator
+        except Exception as e:
+            self.log.emit(f"{Icons.ERROR} Не удалось импортировать генератор: {e}")
+            return
+        gen = CredGenerator(words_file=words_file)
+        proxies = [p.strip() for p in (proxies or []) if p and p.strip()]
+        proxy_count = len(proxies)
+        proxy_idx = 0
+        used_usernames: Set[str] = set()
+        # CSV
+        regs_file = None
+        regs_writer = None
+        try:
+            from pathlib import Path
+            import csv
+            regs_path = Path('logs')/"registrations.csv"
+            regs_path.parent.mkdir(parents=True, exist_ok=True)
+            is_new = not regs_path.exists() or regs_path.stat().st_size == 0
+            regs_file = regs_path.open('a', encoding='utf-8', newline='')
+            regs_writer = csv.writer(regs_file)
+            if is_new:
+                regs_writer.writerow(["ts","username","password","nick","device_id","code","msg","uid"])
+        except Exception:
+            regs_file = None
+            regs_writer = None
+
+        def current_proxy() -> Optional[str]:
+            nonlocal proxy_idx
+            if proxy_count == 0:
+                return reg_proxy
+            p = proxies[proxy_idx % proxy_count]
+            proxy_idx += 1
+            return p
+
+        processed_total = 0
+        success_total = 0
+        fail_total = 0
+
+        try:
+            from fishpoker.api import FishPokerAPI
+        except Exception as e:
+            self.log.emit(f"{Icons.ERROR} FishPoker API недоступен: {e}")
+            return
+
+        for i in range(int(count)):
+            if self._stop:
+                break
+            self._wait_if_paused()
+            # creds
+            def _mk_nick(u: str) -> str:
+                n = gen.derive_nick(u, min_len=6, max_len=20)
+                # FishPoker: если ник совпал с логином — добавим цифры, чтобы он реально изменился
+                try:
+                    if (n or '').lower() == (u or '').lower():
+                        import random
+                        suf = str(random.randint(100, 9999))
+                        base = n
+                        if len(base) + len(suf) > 20:
+                            base = base[: max(1, 20 - len(suf))]
+                        n = (base + suf)[:20]
+                except Exception:
+                    pass
+                return n
+
+            username = gen.generate_login(min_len=6, max_len=16)
+            while username in used_usernames:
+                username = gen.generate_login(min_len=6, max_len=16)
+            used_usernames.add(username)
+            nick = _mk_nick(username)
+            password = gen.generate_password(min_len=6, max_len=16)
+            device_id = self._fp_gen_device_id(username)
+
+            self.log.emit(f"{Icons.PROCESS} [FP] Регистрация [{i+1}/{count}] {username}")
+
+            api = None
+            curp = current_proxy()
+            api = FishPokerAPI(proxy=curp)
+            try:
+                self._live_apis.add(api)
+            except Exception:
+                pass
+
+            max_username_retries = 6
+            max_net_retries = 6
+            uname_retry = 0
+            net_retry = 0
+            reg_ok = False
+            reg_code = -999
+            reg_msg = ''
+
+            while not self._stop:
+                self._wait_if_paused()
+                try:
+                    rsp = api.register(username=username, password=password, device_id=device_id, country='CN')
+                    reg_code = int(rsp.get('code', -1)) if isinstance(rsp, dict) else -1
+                    reg_msg = str(rsp.get('msg', '') or '') if isinstance(rsp, dict) else ''
+                except Exception as e:
+                    reg_code = -999
+                    reg_msg = str(e)
+
+                if reg_code == 0:
+                    reg_ok = True
+                    break
+
+                busy = (reg_code == -1) or (reg_code == 10010008) or (
+                    'username' in (reg_msg or '').lower() and (
+                        'unavailable' in (reg_msg or '').lower() or 'exists' in (reg_msg or '').lower() or 'exist' in (reg_msg or '').lower()
+                    )
+                )
+                if busy and uname_retry < max_username_retries:
+                    old = username
+                    username = gen.generate_login(min_len=6, max_len=16)
+                    while username in used_usernames:
+                        username = gen.generate_login(min_len=6, max_len=16)
+                    used_usernames.add(username)
+                    nick = _mk_nick(username)
+                    uname_retry += 1
+                    self.log.emit(f"{Icons.WARNING} [FP] Имя занято (code={reg_code}). Новая попытка: {old} → {username} ({uname_retry}/{max_username_retries})")
+                    self._sleep(self._rand_delay())
+                    continue
+
+                hard = (reg_code in (-999, -2, 10000044, 20010029)) or ('access' in (reg_msg or '').lower() and 'denied' in (reg_msg or '').lower())
+                if hard and proxy_count > 0 and net_retry < max_net_retries:
+                    try:
+                        self.log.emit(f"{Icons.WARNING} [FP] Ошибка регистрации (code={reg_code} msg={reg_msg}). Смена прокси...")
+                    except Exception:
+                        pass
+                    # close previous session
+                    try:
+                        if api is not None:
+                            sess = getattr(api, 'session', None)
+                            if sess is not None:
+                                sess.close()
+                            try:
+                                self._live_apis.discard(api)
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                    curp = current_proxy()
+                    api = FishPokerAPI(proxy=curp)
+                    try:
+                        self._live_apis.add(api)
+                    except Exception:
+                        pass
+                    net_retry += 1
+                    self._sleep(self._rand_delay())
+                    continue
+
+                break
+
+            if not reg_ok:
+                self.log.emit(f"{Icons.ERROR} [FP] Регистрация отклонена: code={reg_code} msg={reg_msg}")
+                try:
+                    if regs_writer is not None:
+                        import datetime
+                        regs_writer.writerow([datetime.datetime.utcnow().isoformat(), username, password, nick, device_id, reg_code, reg_msg, ''])
+                        regs_file.flush()  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+                fail_total += 1
+                processed_total += 1
+                self._sleep(self._rand_delay())
+                continue
+
+            # login (до 3 попыток на сетевых обрывах)
+            data = None
+            last_login_err = None
+            for att in range(1, 3 + 1):
+                if self._stop:
+                    break
+                self._wait_if_paused()
+                try:
+                    data = api.login(username=username, password=password, device_id=device_id, country='CN')
+                    last_login_err = None
+                    break
+                except Exception as e:
+                    last_login_err = e
+                    if self._stop:
+                        break
+                    s = str(e).lower()
+                    transient = (
+                        ("remotedisconnected" in s)
+                        or ("remote end closed connection without response" in s)
+                        or ("connection aborted" in s)
+                        or ("connection reset" in s)
+                        or ("proxyerror" in s)
+                        or ("max retries exceeded" in s)
+                        or ("read timed out" in s)
+                        or ("connect timeout" in s)
+                        or ("timed out" in s)
+                        or ("bad gateway" in s)
+                        or ("service unavailable" in s)
+                        or ("gateway timeout" in s)
+                    )
+                    if transient and att < 3:
+                        wait_s = 2.0 * att
+                        try:
+                            self.log.emit(f"{Icons.WARNING} [FP] Login: {e}. Повтор {att+1}/3 через {int(wait_s)}с…")
+                        except Exception:
+                            pass
+                        self._sleep(wait_s)
+                        continue
+                    break
+            if data is None:
+                if self._stop:
+                    break
+                e = last_login_err
+                self.log.emit(f"{Icons.ERROR} [FP] Ошибка login после регистрации: {e}")
+                try:
+                    if regs_writer is not None:
+                        import datetime
+                        regs_writer.writerow([datetime.datetime.utcnow().isoformat(), username, password, nick, device_id, -999, f"login:{e}", ''])
+                        regs_file.flush()  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+                fail_total += 1
+                processed_total += 1
+                self._sleep(self._rand_delay())
+                continue
+
+            code = int(data.get('code', -1)) if isinstance(data, dict) else -1
+            if code != 0 or not getattr(api, 'token', None):
+                self.log.emit(f"{Icons.ERROR} [FP] Login отклонён: code={code}")
+                try:
+                    if regs_writer is not None:
+                        import datetime
+                        regs_writer.writerow([datetime.datetime.utcnow().isoformat(), username, password, nick, device_id, code, 'login_failed', ''])
+                        regs_file.flush()  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+                fail_total += 1
+                processed_total += 1
+                self._sleep(self._rand_delay())
+                continue
+
+            uid = api.get_uid_from_login_response(data)
+
+            # Перед сменой профиля (аватар/ник) дадим аккаунту "созреть"
+            # Это уменьшает случаи, когда сервер отвечает OK, но изменения не применяются сразу.
+            if (uid and api.token) and ((change_avatar and avatar_path) or change_nick):
+                self._sleep(4.0)
+
+            # Avatar (per-account), 2 retries, 7s interval
+            if change_avatar and avatar_path and uid and api.token:
+                max_avatar_attempts = 3
+                last_err = None
+                url = None
+                for att in range(1, max_avatar_attempts + 1):
+                    if self._stop:
+                        break
+                    self._wait_if_paused()
+                    try:
+                        url = self._fp_upload_avatar(api, int(uid), avatar_path)
+                        if url:
+                            self.log.emit(f"{Icons.INFO} [FP] Аватар загружен: {url}")
+                            break
+                    except Exception as e:
+                        last_err = e
+                    if att < max_avatar_attempts:
+                        try:
+                            self.log.emit(f"{Icons.WARNING} [FP] Аватар: повторная попытка {att+1}/{max_avatar_attempts} через 7с")
+                        except Exception:
+                            pass
+                        for _ in range(7):
+                            if self._stop:
+                                break
+                            self._sleep(1.0)
+                if not url:
+                    if last_err:
+                        self.log.emit(f"{Icons.WARNING} [FP] Аватар не загружен после {max_avatar_attempts} попыток: {last_err}")
+                    else:
+                        self.log.emit(f"{Icons.WARNING} [FP] Аватар не загружен после {max_avatar_attempts} попыток")
+
+            # TCP change nick (2 retries, 7s interval)
+            if change_nick and uid and api.token:
+                # дополнительная пауза перед сменой ника (часто помогает)
+                self._sleep(4.0)
+                max_nick_attempts = 3
+                okn = False
+                last_msg = ''
+                endpoints = list(getattr(api, 'tcp_entries', []) or [])
+                for att in range(1, max_nick_attempts + 1):
+                    if self._stop:
+                        break
+                    self._wait_if_paused()
+                    try:
+                        okn, rsp = api.change_username_tcp(uid=int(uid), token=str(api.token), nickname=nick, endpoints=endpoints, cancel_event=self._cancel_event)
+                        if okn:
+                            self.log.emit(f"{Icons.INFO} [FP] Смена ника [{username}] → '{nick}': успех")
+                            break
+                        last_msg = str(rsp)
+                    except Exception as e:
+                        last_msg = str(e)
+                    if not okn and att < max_nick_attempts:
+                        try:
+                            self.log.emit(f"{Icons.WARNING} [FP] Смена ника: повторная попытка {att+1}/{max_nick_attempts} через 7с ({last_msg})")
+                        except Exception:
+                            pass
+                        for _ in range(7):
+                            if self._stop:
+                                break
+                            self._sleep(1.0)
+                if not okn:
+                    self.log.emit(f"{Icons.WARNING} [FP] Смена ника не удалась после {max_nick_attempts} попыток: {last_msg}")
+
+            # Emit account
+            acc = Account(username=username, password=password, device_id=device_id)
+            acc.proxy = api.proxy_url
+            acc.token = api.token
+            acc.uid = int(uid) if uid else None
+            acc.last_login_at = time.time()
+            try:
+                acc.headers = api.session.headers.copy() if hasattr(api, 'session') else {}
+            except Exception:
+                acc.headers = {}
+            # Store TCP+version hints into extra
+            try:
+                eps = getattr(api, 'tcp_entries', None)
+                if eps:
+                    acc.extra['tcp_entries'] = list(eps)
+                cv = getattr(api, 'client_version', None)
+                if cv:
+                    acc.extra['client_version'] = str(cv)
+                cip = getattr(api, 'client_ip', None)
+                if cip:
+                    acc.extra['client_ip'] = str(cip)
+            except Exception:
+                pass
+            self.new_account.emit(acc)
+            self.log.emit(f"{Icons.SUCCESS} [FP] Зарегистрирован аккаунт: {username} (uid={acc.uid})")
+
+            try:
+                if regs_writer is not None:
+                    import datetime
+                    regs_writer.writerow([datetime.datetime.utcnow().isoformat(), username, password, nick, device_id, 0, 'FishPoker', acc.uid or ''])
+                    regs_file.flush()  # type: ignore[attr-defined]
+            except Exception:
+                pass
+
+            success_total += 1
+            processed_total += 1
+
+            # close session
+            try:
+                if api is not None:
+                    sess = getattr(api, 'session', None)
+                    if sess is not None:
+                        sess.close()
+                    try:
+                        self._live_apis.discard(api)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+            self._sleep(self._rand_delay())
+
+        try:
+            if regs_file:
+                regs_file.close()
+        except Exception:
+            pass
+        self.log.emit(f"{Icons.SUCCESS if fail_total==0 else Icons.INFO} 🏁 Конец FishPoker: {processed_total}/{count} (успешно: {success_total}, ошибки: {fail_total})")
+
+    def task_register_fishpoker_parallel(self, count: int, change_nick: bool = True, change_avatar: bool = True, words_file: Optional[str] = None, reg_proxy: Optional[str] = None, delay_min_ms: int = 400, delay_max_ms: int = 900, proxies: Optional[List[str]] = None, threads: int = 1, proxies_per_thread: int = 0, avatar_path: Optional[str] = None):
+        """Параллельная регистрация FishPoker по общей очереди задач."""
+        try:
+            self._stop = False
+            if getattr(self, "_pause", False):
+                self._pause = False
+                try:
+                    self.pause_changed.emit(False)
+                except Exception:
+                    pass
+            if hasattr(self, "_cancel_event"):
+                self._cancel_event.clear()
+        except Exception:
+            pass
+        try:
+            threads = max(1, int(threads))
+        except Exception:
+            threads = 1
+        if threads <= 1:
+            return self.task_register_fishpoker(count, change_nick, change_avatar, words_file, reg_proxy, delay_min_ms, delay_max_ms, proxies, avatar_path)
+        # jitter
+        try:
+            a = int(delay_min_ms); b = int(delay_max_ms)
+            if b < a: a, b = b, a
+            self.jitter_ms = (max(0, a), max(0, b))
+        except Exception:
+            self.jitter_ms = (400, 900)
+        import threading, queue
+        import random
+        # split proxies into per-thread groups
+        proxies_all = [p.strip() for p in (proxies or []) if p and p.strip()]
+        random.shuffle(proxies_all)
+        ppt = max(0, int(proxies_per_thread))
+        proxy_groups: list[list[str]] = []
+        if ppt > 0 and proxies_all:
+            it = iter(proxies_all)
+            for _ in range(threads):
+                grp = []
+                for _k in range(ppt):
+                    try:
+                        grp.append(next(it))
+                    except StopIteration:
+                        break
+                proxy_groups.append(grp)
+        else:
+            if proxies_all:
+                chunk = (len(proxies_all) + threads - 1)//threads
+                for i in range(threads):
+                    s = i*chunk; e = min(len(proxies_all), (i+1)*chunk)
+                    proxy_groups.append(proxies_all[s:e])
+            else:
+                proxy_groups = [[] for _ in range(threads)]
+
+        # CSV log
+        from pathlib import Path
+        import csv
+        regs_path = Path('logs')/"registrations.csv"
+        regs_path.parent.mkdir(parents=True, exist_ok=True)
+        regs_file = regs_path.open('a', encoding='utf-8', newline='')
+        regs_writer = csv.writer(regs_file)
+        try:
+            if regs_path.stat().st_size == 0:
+                regs_writer.writerow(["ts","username","password","nick","device_id","code","msg","uid"])
+        except Exception:
+            pass
+        csv_lock = threading.Lock()
+
+        q: "queue.Queue[int]" = queue.Queue()
+        for j in range(int(count)):
+            q.put(j+1)
+
+        counts_lock = threading.Lock()
+        processed_total = 0
+        success_total = 0
+        fail_total = 0
+
+        usernames_global: Set[str] = set()
+        usernames_lock = threading.Lock()
+
+        def worker_fn(wi: int, pgroup: list[str]):
+            nonlocal processed_total, success_total, fail_total
+            try:
+                from core.credgen import CredGenerator
+                from fishpoker.api import FishPokerAPI
+            except Exception as e:
+                self.log.emit(f"{Icons.ERROR} [T{wi}] Импорты недоступны: {e}")
+                return
+            gen = CredGenerator(words_file=words_file)
+            proxy_idx = 0
+
+            def _mk_nick(u: str) -> str:
+                n = gen.derive_nick(u, min_len=6, max_len=20)
+                try:
+                    if (n or '').lower() == (u or '').lower():
+                        import random
+                        suf = str(random.randint(100, 9999))
+                        base = n
+                        if len(base) + len(suf) > 20:
+                            base = base[: max(1, 20 - len(suf))]
+                        n = (base + suf)[:20]
+                except Exception:
+                    pass
+                return n
+
+            def current_proxy() -> Optional[str]:
+                nonlocal proxy_idx
+                if not pgroup:
+                    return reg_proxy
+                p = pgroup[proxy_idx % len(pgroup)]
+                proxy_idx += 1
+                return p
+
+            while not self._stop:
+                try:
+                    token = q.get_nowait()
+                except queue.Empty:
+                    break
+                api = None
+                try:
+                    self._wait_if_paused()
+                    # reserve unique username
+                    while True:
+                        cand = gen.generate_login(min_len=6, max_len=16)
+                        with usernames_lock:
+                            if cand not in usernames_global:
+                                usernames_global.add(cand)
+                                break
+                    username = cand
+                    nick = _mk_nick(username)
+                    password = gen.generate_password(min_len=6, max_len=16)
+                    device_id = self._fp_gen_device_id(username)
+
+                    curp = current_proxy()
+                    api = FishPokerAPI(proxy=curp)
+                    try:
+                        self._live_apis.add(api)
+                    except Exception:
+                        pass
+
+                    # register (busy username retries)
+                    reg_ok = False
+                    reg_code = -999
+                    reg_msg = ''
+                    max_username_retries = 4
+                    attempt = 0
+                    while attempt <= max_username_retries and not reg_ok and not self._stop:
+                        try:
+                            rsp = api.register(username=username, password=password, device_id=device_id, country='CN')
+                            reg_code = int(rsp.get('code', -1)) if isinstance(rsp, dict) else -1
+                            reg_msg = str(rsp.get('msg', '') or '') if isinstance(rsp, dict) else ''
+                        except Exception as e:
+                            reg_code = -999
+                            reg_msg = str(e)
+
+                        if reg_code == 0:
+                            reg_ok = True
+                            break
+
+                        busy = (reg_code == -1) or (reg_code == 10010008) or (
+                            'username' in (reg_msg or '').lower() and (
+                                'unavailable' in (reg_msg or '').lower() or 'exists' in (reg_msg or '').lower() or 'exist' in (reg_msg or '').lower()
+                            )
+                        )
+                        if busy and attempt < max_username_retries:
+                            old = username
+                            # reserve new username
+                            while True:
+                                cand2 = gen.generate_login(min_len=6, max_len=16)
+                                with usernames_lock:
+                                    if cand2 not in usernames_global:
+                                        usernames_global.add(cand2)
+                                        break
+                            username = cand2
+                            nick = _mk_nick(username)
+                            attempt += 1
+                            self.log.emit(f"{Icons.WARNING} [T{wi}] [FP] Имя занято (code={reg_code}), новая попытка: {old} → {username} ({attempt}/{max_username_retries})")
+                            self._sleep(self._rand_delay())
+                            continue
+                        break
+
+                    if not reg_ok:
+                        self.log.emit(f"{Icons.ERROR} [T{wi}] [FP] Регистрация отклонена: code={reg_code} msg={reg_msg}")
+                        with counts_lock:
+                            fail_total += 1
+                            processed_total += 1
+                        q.task_done()
+                        self._sleep(self._rand_delay())
+                        continue
+
+                    # login (до 3 попыток на сетевых обрывах)
+                    data = None
+                    last_login_err = None
+                    for att in range(1, 3 + 1):
+                        if self._stop:
+                            break
+                        self._wait_if_paused()
+                        try:
+                            data = api.login(username=username, password=password, device_id=device_id, country='CN')
+                            last_login_err = None
+                            break
+                        except Exception as e:
+                            last_login_err = e
+                            if self._stop:
+                                break
+                            s = str(e).lower()
+                            transient = (
+                                ("remotedisconnected" in s)
+                                or ("remote end closed connection without response" in s)
+                                or ("connection aborted" in s)
+                                or ("connection reset" in s)
+                                or ("proxyerror" in s)
+                                or ("max retries exceeded" in s)
+                                or ("read timed out" in s)
+                                or ("connect timeout" in s)
+                                or ("timed out" in s)
+                                or ("bad gateway" in s)
+                                or ("service unavailable" in s)
+                                or ("gateway timeout" in s)
+                            )
+                            if transient and att < 3:
+                                wait_s = 2.0 * att
+                                try:
+                                    self.log.emit(f"{Icons.WARNING} [T{wi}] [FP] Login: {e}. Повтор {att+1}/3 через {int(wait_s)}с…")
+                                except Exception:
+                                    pass
+                                self._sleep(wait_s)
+                                continue
+                            break
+                    if data is None:
+                        if self._stop:
+                            try:
+                                q.task_done()
+                            except Exception:
+                                pass
+                            break
+                        self.log.emit(f"{Icons.ERROR} [T{wi}] [FP] Ошибка login: {last_login_err}")
+                        with counts_lock:
+                            fail_total += 1
+                            processed_total += 1
+                        q.task_done()
+                        self._sleep(self._rand_delay())
+                        continue
+
+                    code = int(data.get('code', -1)) if isinstance(data, dict) else -1
+                    if code != 0 or not getattr(api, 'token', None):
+                        self.log.emit(f"{Icons.ERROR} [T{wi}] [FP] Login отклонён: code={code}")
+                        with counts_lock:
+                            fail_total += 1
+                            processed_total += 1
+                        q.task_done()
+                        self._sleep(self._rand_delay())
+                        continue
+
+
+                    uid = api.get_uid_from_login_response(data)
+
+                    # Перед сменой профиля (аватар/ник) дадим аккаунту "созреть"
+                    if (uid and api.token) and ((change_avatar and avatar_path) or change_nick):
+                        self._sleep(4.0)
+
+                    # avatar (2 retries, 7s interval)
+                    if change_avatar and avatar_path and uid and api.token:
+                        max_avatar_attempts = 3
+                        last_err = None
+                        url = None
+                        for att in range(1, max_avatar_attempts + 1):
+                            if self._stop:
+                                break
+                            self._wait_if_paused()
+                            try:
+                                url = self._fp_upload_avatar(api, int(uid), avatar_path)
+                                if url:
+                                    self.log.emit(f"{Icons.INFO} [T{wi}] [FP] Аватар загружен: {url}")
+                                    break
+                            except Exception as e:
+                                last_err = e
+                            if att < max_avatar_attempts:
+                                self._sleep(7.0)
+                        if not url and last_err:
+                            self.log.emit(f"{Icons.WARNING} [T{wi}] [FP] Аватар не загружен после {max_avatar_attempts} попыток: {last_err}")
+
+                    # nick via TCP (2 retries, 7s interval)
+                    if change_nick and uid and api.token:
+                        # дополнительная пауза перед сменой ника
+                        self._sleep(4.0)
+                        max_nick_attempts = 3
+                        okn = False
+                        last_msg = ''
+                        endpoints = list(getattr(api, 'tcp_entries', []) or [])
+                        for att in range(1, max_nick_attempts + 1):
+                            if self._stop:
+                                break
+                            self._wait_if_paused()
+                            try:
+                                okn, rsp = api.change_username_tcp(uid=int(uid), token=str(api.token), nickname=nick, endpoints=endpoints, cancel_event=self._cancel_event)
+                                if okn:
+                                    self.log.emit(f"{Icons.INFO} [T{wi}] [FP] Смена ника [{username}] → '{nick}': успех")
+                                    break
+                                last_msg = str(rsp)
+                            except Exception as e:
+                                last_msg = str(e)
+                            if not okn and att < max_nick_attempts:
+                                self._sleep(7.0)
+                        if not okn:
+                            self.log.emit(f"{Icons.WARNING} [T{wi}] [FP] Смена ника не удалась после {max_nick_attempts} попыток: {last_msg}")
+
+                    acc = Account(username=username, password=password, device_id=device_id)
+                    acc.proxy = api.proxy_url
+                    acc.token = api.token
+                    acc.uid = int(uid) if uid else None
+                    acc.last_login_at = time.time()
+                    try:
+                        acc.headers = api.session.headers.copy() if hasattr(api, 'session') else {}
+                    except Exception:
+                        acc.headers = {}
+                    try:
+                        eps = getattr(api, 'tcp_entries', None)
+                        if eps:
+                            acc.extra['tcp_entries'] = list(eps)
+                        cv = getattr(api, 'client_version', None)
+                        if cv:
+                            acc.extra['client_version'] = str(cv)
+                        cip = getattr(api, 'client_ip', None)
+                        if cip:
+                            acc.extra['client_ip'] = str(cip)
+                    except Exception:
+                        pass
+
+                    self.new_account.emit(acc)
+                    self.log.emit(f"{Icons.SUCCESS} [T{wi}] [FP] Зарегистрирован аккаунт: {username} (uid={acc.uid})")
+
+                    try:
+                        with csv_lock:
+                            import datetime
+                            regs_writer.writerow([datetime.datetime.utcnow().isoformat(), username, password, nick, device_id, 0, 'FishPoker', acc.uid or ''])
+                            regs_file.flush()
+                    except Exception:
+                        pass
+
+                    with counts_lock:
+                        success_total += 1
+                        processed_total += 1
+
+                    q.task_done()
+                except Exception as e:
+                    try:
+                        self.log.emit(f"{Icons.ERROR} [T{wi}] [FP] Ошибка регистрации: {e}")
+                    except Exception:
+                        pass
+                    try:
+                        with counts_lock:
+                            fail_total += 1
+                            processed_total += 1
+                    except Exception:
+                        pass
+                    try:
+                        q.task_done()
+                    except Exception:
+                        pass
+                finally:
+                    try:
+                        if api is not None:
+                            sess = getattr(api, 'session', None)
+                            if sess is not None:
+                                sess.close()
+                            try:
+                                self._live_apis.discard(api)
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                self._sleep(self._rand_delay())
+
+        ths: list[threading.Thread] = []
+        for i in range(int(threads)):
+            pg = proxy_groups[i] if i < len(proxy_groups) else []
+            t = threading.Thread(target=worker_fn, args=(i+1, pg), daemon=True)
+            ths.append(t)
+            t.start()
+        for t in ths:
+            t.join()
+        try:
+            regs_file.close()
+        except Exception:
+            pass
+        icon = Icons.SUCCESS if fail_total == 0 else Icons.INFO
+        self.log.emit(f"{icon} 🏁 Конец FishPoker: {processed_total}/{count} (успешно: {success_total}, ошибки: {fail_total})")
+
     def task_register_pppoker(self, count: int, change_nick: bool = True, change_avatar: bool = True, words_file: Optional[str] = None, reg_proxy: Optional[str] = None, delay_min_ms: int = 400, delay_max_ms: int = 900, proxies: Optional[List[str]] = None, avatar_path: Optional[str] = None):
         """Регистрация для PPPoker: по факту login создаёт нового пользователя.
         Для каждого аккаунта: HTTP login -> (опц.) HTTP upload avatar -> (опц.) TCP change nick -> emit new_account.
         """
         try:
             self._stop = False
+            if getattr(self, "_pause", False):
+                self._pause = False
+                try:
+                    self.pause_changed.emit(False)
+                except Exception:
+                    pass
             if hasattr(self, "_cancel_event"):
                 self._cancel_event.clear()
         except Exception:
@@ -1091,6 +2113,12 @@ class Worker(QThread):
         """Параллельная регистрация PPPoker по общей очереди задач (как XPoker)."""
         try:
             self._stop = False
+            if getattr(self, "_pause", False):
+                self._pause = False
+                try:
+                    self.pause_changed.emit(False)
+                except Exception:
+                    pass
             if hasattr(self, "_cancel_event"):
                 self._cancel_event.clear()
         except Exception:
@@ -1427,9 +2455,15 @@ class Worker(QThread):
         Работает последовательно. Задержка между шагами — случайная в заданном диапазоне.
         Поддержка списка прокси с ротацией при "жёстких" ошибках регистрации.
         """
-        # Сброс сигнала остановки и очистка события отмены перед стартом задачи
+        # Сброс сигнала остановки/паузы и очистка события отмены перед стартом задачи
         try:
             self._stop = False
+            if getattr(self, "_pause", False):
+                self._pause = False
+                try:
+                    self.pause_changed.emit(False)
+                except Exception:
+                    pass
             if hasattr(self, "_cancel_event"):
                 self._cancel_event.clear()
         except Exception:
@@ -1945,9 +2979,15 @@ class Worker(QThread):
         - proxies_per_thread: сколько прокси выделить на поток (0 = авто-деление)
         Прочая логика (ретраи, CSV, смена ника/аватара, cooldown на 5xx) совпадает с последовательной.
         """
-        # Сброс сигнала остановки и очистка события отмены перед стартом задачи
+        # Сброс сигнала остановки/паузы и очистка события отмены перед стартом задачи
         try:
             self._stop = False
+            if getattr(self, "_pause", False):
+                self._pause = False
+                try:
+                    self.pause_changed.emit(False)
+                except Exception:
+                    pass
             if hasattr(self, "_cancel_event"):
                 self._cancel_event.clear()
         except Exception:
@@ -2875,6 +3915,823 @@ class UpdateDownloadThread(QThread):
             self.finished.emit(False, "download_failed")
 
 
+class FishPokerTab(QWidget):
+    def update_table_theme(self) -> None:
+        """Светлая/тёмная тема таблицы — как у XPoker, но селекторы без id для строгого применения."""
+        try:
+            t = self.tbl
+        except Exception:
+            return
+        if not isinstance(t, QTableWidget):
+            return
+        # Определяем эффективный режим темы из окна (QTabWidget может переписать parent)
+        eff = 'light'
+        try:
+            mw = self.window()
+            if not (mw and hasattr(mw, 'current_theme_mode')):
+                # Поищем выше по иерархии
+                p = self.parent()
+                while p is not None and not hasattr(p, 'current_theme_mode'):
+                    p = getattr(p, 'parent', lambda: None)()
+                if p is not None:
+                    mw = p
+            if mw and getattr(mw, 'current_theme_mode', None) in ('light', 'dark'):
+                eff = mw.current_theme_mode
+        except Exception:
+            pass
+        if eff == 'dark':
+            try:
+                t.setStyleSheet(
+                    "QTableWidget, QTableView, QTableWidget::viewport, QTableView::viewport {"
+                    " background-color: #1e1e1e;"
+                    "}"
+                    "QTableCornerButton::section {"
+                    " background-color: #1e1e1e;"
+                    "}"
+                )
+                t.viewport().setStyleSheet("background-color: #1e1e1e;")
+            except Exception:
+                pass
+            try:
+                vh = t.verticalHeader()
+                if vh is not None:
+                    vh.setStyleSheet(
+                        "QHeaderView { background-color: #1e1e1e; }"
+                        "QHeaderView::section { background-color: #1e1e1e; color: #d0d0d0; border: none; }"
+                    )
+                    pal = vh.palette()
+                    pal.setColor(QPalette.ColorRole.Button, QColor("#1e1e1e"))
+                    pal.setColor(QPalette.ColorRole.Window, QColor("#1e1e1e"))
+                    pal.setColor(QPalette.ColorRole.Base, QColor("#1e1e1e"))
+                    vh.setPalette(pal)
+                    vh.setAutoFillBackground(True)
+            except Exception:
+                pass
+        else:
+            try:
+                # Сбрасываем QSS/палитры
+                t.setStyleSheet("")
+                t.viewport().setStyleSheet("")
+                try:
+                    pal = QApplication.palette()
+                    t.setPalette(pal)
+                    t.viewport().setAutoFillBackground(False)
+                except Exception:
+                    pass
+                # Хедеры
+                vh = t.verticalHeader()
+                if vh is not None:
+                    vh.setStyleSheet("")
+                    vh.setAutoFillBackground(False)
+                    try:
+                        vh.setPalette(QApplication.palette())
+                    except Exception:
+                        pass
+                hh = t.horizontalHeader()
+                if hh is not None:
+                    hh.setStyleSheet("")
+                    try:
+                        hh.setPalette(QApplication.palette())
+                    except Exception:
+                        pass
+                # Стиль как у XPoker (без id)
+                ss_light = (
+                    "QTableWidget, QTableWidget::viewport {"
+                    " background-color: #f7f7f7;"
+                    " alternate-background-color: #ffffff;"
+                    "}"
+                    "QTableWidget {"
+                    " gridline-color: #e0e0e0;"
+                    "}"
+                    "QHeaderView::section:horizontal {"
+                    " background-color: #fafafa; color: #222; border: 1px solid #e6e6e6; padding: 4px;"
+                    "}"
+                    "QHeaderView::section:vertical {"
+                    " background-color: #f7f7f7; color: #666; border: none;"
+                    "}"
+                    "QTableCornerButton::section {"
+                    " background-color: #fafafa; border: 1px solid #e6e6e6;"
+                    "}"
+                    "QTableWidget::item:selected {"
+                    " background-color: #cfe8ff; color: #000;"
+                    "}"
+                )
+                try:
+                    t.setAlternatingRowColors(True)
+                except Exception:
+                    pass
+                try:
+                    t.setStyleSheet(ss_light)
+                except Exception:
+                    pass
+                try:
+                    t.style().unpolish(t)
+                    t.style().polish(t)
+                    t.update()
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+    def _gen_device_id(self, seed: str) -> str:
+        """FishPoker uses a MAC-like device id (6 bytes hex with hyphens)."""
+        try:
+            import hashlib
+            import secrets
+
+            if seed:
+                h = hashlib.md5(str(seed).encode('utf-8')).digest()
+                b = bytearray(h[:6])
+            else:
+                b = bytearray(secrets.token_bytes(6))
+            b[0] = (b[0] & 0xFE) | 0x02
+            return '-'.join(f"{x:02X}" for x in b)
+        except Exception:
+            return '02-00-00-00-00-01'
+
+    def _ensure_device_id(self, value: str, username: str) -> str:
+        import re
+
+        v = (value or '').strip()
+        if not v:
+            return self._gen_device_id(username)
+        s = v.strip().replace(':', '-').replace(' ', '').upper()
+        # XX-XX-XX-XX-XX-XX
+        if re.fullmatch(r'[0-9A-F]{2}(-[0-9A-F]{2}){5}', s):
+            return s
+        # 12 hex -> format
+        s2 = s.replace('-', '')
+        if re.fullmatch(r'[0-9A-F]{12}', s2):
+            return '-'.join(s2[i:i+2] for i in range(0, 12, 2))
+        # 40-hex (например PPPoker imei40) -> стабильно преобразуем
+        if re.fullmatch(r'[0-9A-F]{40}', s2):
+            try:
+                import hashlib
+
+                h = hashlib.md5(s2.encode('utf-8')).hexdigest()[:12].upper()
+                return '-'.join(h[i:i+2] for i in range(0, 12, 2))
+            except Exception:
+                return self._gen_device_id(s2)
+        # Вытаскиваем первые 6 байт, если похоже на MAC в другом формате
+        pairs = re.findall(r'[0-9A-F]{2}', s2)
+        if len(pairs) >= 6:
+            return '-'.join(pairs[:6])
+        return self._gen_device_id(s or username)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        from fishpoker.api import FishPokerAPI, ApiError as FishApiError
+        # State
+        self.accounts: List[Account] = []
+        self.club_ids: List[str] = []
+        self.report_rows: List[dict] = []
+        self.account_row_by_username: Dict[str, int] = {}
+        self._suppress_item_changed = False
+
+        # Layout
+        v = QVBoxLayout(self)
+
+        # Accounts group
+        accounts_group = QGroupBox("📋 Управление аккаунтами")
+        accounts_layout = QHBoxLayout(accounts_group)
+        self.btn_add_account = QPushButton("➕ Добавить аккаунт")
+        self.btn_edit_account = QPushButton("✏️ Редактировать")
+        self.btn_delete_account = QPushButton("🗑️ Удалить")
+        self.btn_load_accounts = QPushButton("📁 Из Excel файла")
+        self.btn_save_accounts = QPushButton("💾 Сохранить настройки")
+        self.btn_generate_accounts = QPushButton("🧪 Сгенерировать аккаунты")
+        for b in (self.btn_add_account, self.btn_edit_account, self.btn_delete_account, self.btn_load_accounts, self.btn_save_accounts, self.btn_generate_accounts):
+            accounts_layout.addWidget(b)
+        accounts_layout.addStretch()
+        v.addWidget(accounts_group)
+
+        # Clubs group
+        clubs_group = QGroupBox("🏛️ Управление клубами")
+        clubs_layout = QHBoxLayout(clubs_group)
+        self.btn_add_clubs = QPushButton("➕ Добавить клубы")
+        self.btn_clear_clubs = QPushButton("🗑️ Очистить список")
+        self.btn_load_clubs = QPushButton("📁 Из Excel файла")
+        self.btn_load_club_distribution = QPushButton("📊 Распределение клубов")
+        self.clubs_count_label = QLabel("Клубов: 0")
+        for b in (self.btn_add_clubs, self.btn_clear_clubs, self.btn_load_clubs, self.btn_load_club_distribution):
+            clubs_layout.addWidget(b)
+        clubs_layout.addWidget(self.clubs_count_label)
+        clubs_layout.addStretch()
+        v.addWidget(clubs_group)
+
+        # Operations group
+        operations_group = QGroupBox("🚀 Операции")
+        operations_layout = QHBoxLayout(operations_group)
+        self.btn_login = QPushButton("🔐 Войти во все")
+        self.btn_logout = QPushButton("🚪 Выйти из выбранных")
+        self.btn_join = QPushButton("🎯 Начать вступление")
+        self.btn_pause = QPushButton("⏸ Пауза"); self.btn_pause.setEnabled(False)
+        self.btn_stop = QPushButton("🛑 Остановить"); self.btn_stop.setEnabled(False)
+        self.btn_export = QPushButton("📊 Экспорт отчета")
+        for b in (self.btn_login, self.btn_logout, self.btn_join, self.btn_pause, self.btn_stop, self.btn_export):
+            operations_layout.addWidget(b)
+        operations_layout.addStretch()
+        v.addWidget(operations_group)
+
+        # Knobs
+        knobs = QHBoxLayout()
+        knobs.addWidget(QLabel("Клубов на аккаунт (0 = все клубы):"))
+        self.spn_clubs_per_account = QSpinBox(); self.spn_clubs_per_account.setRange(0, 1000000); self.spn_clubs_per_account.setValue(500)
+        knobs.addWidget(self.spn_clubs_per_account)
+        knobs.addWidget(QLabel("Задержка мин (мс):"))
+        self.spn_delay_min = QSpinBox(); self.spn_delay_min.setRange(0, 10000); self.spn_delay_min.setValue(500)
+        knobs.addWidget(self.spn_delay_min)
+        knobs.addWidget(QLabel("Задержка макс (мс):"))
+        self.spn_delay_max = QSpinBox(); self.spn_delay_max.setRange(0, 20000); self.spn_delay_max.setValue(1500)
+        knobs.addWidget(self.spn_delay_max)
+        knobs.addWidget(QLabel("Параллельно (TCP):"))
+        self.spn_join_threads = QSpinBox(); self.spn_join_threads.setRange(1, 1000); self.spn_join_threads.setValue(64)
+        knobs.addWidget(self.spn_join_threads)
+        self.chk_shuffle = QCheckBox("Перемешать ID клубов"); self.chk_shuffle.setChecked(True)
+        knobs.addWidget(self.chk_shuffle)
+        v.addLayout(knobs)
+
+        # Message field (40 chars)
+        msg_row = QHBoxLayout()
+        msg_row.addWidget(QLabel("Сообщение заявки (до 40 символов):"))
+        self.txt_message = QLineEdit(); self.txt_message.setMaxLength(40); self.txt_message.setPlaceholderText("Например: Примите, пожалуйста")
+        msg_row.addWidget(self.txt_message)
+        v.addLayout(msg_row)
+
+        # Accounts table
+        base_cols = len(ACCOUNTS_COLUMNS)
+        self.PROG_COL = base_cols + 0
+        self.STATUS_COL = base_cols + 1
+        self.CURRENT_COL = base_cols + 2
+        self.tbl = QTableWidget(0, base_cols + len(EXTRA_COLUMNS))
+        self.tbl.setObjectName("accountsTable")
+        self.tbl.setHorizontalHeaderLabels(ACCOUNTS_COLUMNS + EXTRA_COLUMNS)
+        self.tbl.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.tbl.itemChanged.connect(self.on_cell_changed)
+        v.addWidget(self.tbl, stretch=1)
+
+        v.addWidget(QLabel("Журнал событий:"))
+        self.log = QPlainTextEdit(); self.log.setReadOnly(True)
+        v.addWidget(self.log, stretch=1)
+
+        # Worker
+        self.worker = Worker(self.accounts, api_class=FishPokerAPI, api_error_class=FishApiError)
+        self.worker.log.connect(self.on_worker_log)
+        self.worker.account_updated.connect(self.on_account_updated)
+        self.worker.join_result.connect(self.on_join_result)
+        self.worker.task_finished.connect(self.on_task_finished)
+        self.worker.pause_changed.connect(self.on_worker_pause_changed)
+        self.worker.account_progress.connect(self.on_account_progress)
+        try:
+            self.worker.new_account.connect(self.on_new_account)
+        except Exception:
+            pass
+        try:
+            self.worker.started.connect(self.on_worker_started)
+            self.worker.finished.connect(self.on_worker_finished)
+        except Exception:
+            pass
+
+        # Wire up buttons
+        self.btn_add_account.clicked.connect(self.on_add_account)
+        self.btn_edit_account.clicked.connect(self.on_edit_account)
+        self.btn_delete_account.clicked.connect(self.on_delete_account)
+        self.btn_load_accounts.clicked.connect(self.on_load_accounts)
+        self.btn_save_accounts.clicked.connect(self.on_save_accounts)
+        self.btn_generate_accounts.clicked.connect(self.on_generate_accounts)
+        self.btn_add_clubs.clicked.connect(self.on_add_clubs)
+        self.btn_clear_clubs.clicked.connect(self.on_clear_clubs)
+        self.btn_load_clubs.clicked.connect(self.on_load_clubs)
+        self.btn_load_club_distribution.clicked.connect(self.on_load_club_distribution)
+        self.btn_login.clicked.connect(self.on_login_all)
+        self.btn_logout.clicked.connect(self.on_logout_selected)
+        self.btn_join.clicked.connect(self.on_join)
+        self.btn_pause.clicked.connect(self.on_pause)
+        self.btn_stop.clicked.connect(self.on_stop)
+        self.btn_export.clicked.connect(self.on_export_report)
+        try:
+            self.spn_clubs_per_account.valueChanged.connect(self.save_settings)
+            self.spn_delay_min.valueChanged.connect(self.save_settings)
+            self.spn_delay_max.valueChanged.connect(self.save_settings)
+            self.chk_shuffle.toggled.connect(self.save_settings)
+            self.txt_message.textChanged.connect(self.save_settings)
+        except Exception:
+            pass
+
+        self.load_settings()
+        try:
+            self.update_table_theme()
+        except Exception:
+            pass
+
+    # ====== Event handlers / helpers (FishPoker) ======
+    def on_worker_log(self, line: str):
+        self.log.appendPlainText(line)
+
+    def on_save_accounts(self):
+        try:
+            self.save_settings()
+            QMessageBox.information(self, "Сохранение", "Настройки сохранены успешно!")
+            self.log.appendPlainText(f"{Icons.SUCCESS} Настройки сохранены")
+        except Exception as e:
+            QMessageBox.critical(self, "Ошибка", f"Не удалось сохранить настройки: {e}")
+
+    def _append_account_row(self, acc: Account):
+        r = self.tbl.rowCount()
+        self.tbl.insertRow(r)
+        data = acc.as_row()
+        self._suppress_item_changed = True
+        try:
+            for c, v in enumerate(data):
+                it = QTableWidgetItem(str(v))
+                if c in (1, 4, 5):
+                    it.setFlags(it.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                self.tbl.setItem(r, c, it)
+            prog = QProgressBar(); prog.setRange(0,1); prog.setValue(0); prog.setTextVisible(True); prog.setFormat("0/0 (0%)")
+            self.tbl.setCellWidget(r, self.PROG_COL, prog)
+            st_it = QTableWidgetItem("⏳ Ожидание"); st_it.setFlags(st_it.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            self.tbl.setItem(r, self.STATUS_COL, st_it)
+            cur_it = QTableWidgetItem("-"); cur_it.setFlags(cur_it.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            self.tbl.setItem(r, self.CURRENT_COL, cur_it)
+        finally:
+            self._suppress_item_changed = False
+        self.account_row_by_username[acc.username.lower()] = r
+
+    def on_cell_changed(self, item: QTableWidgetItem):
+        if self._suppress_item_changed:
+            return
+        row = item.row(); col = item.column()
+        if row < 0 or row >= len(self.accounts):
+            return
+        acc = self.accounts[row]
+        text = item.text().strip()
+        if col in (1,4,5):
+            self._suppress_item_changed = True
+            try:
+                current = acc.as_row()[col]
+                item.setText(str(current))
+                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            finally:
+                self._suppress_item_changed = False
+            return
+        changed = False
+        if col == 0 and text and text != acc.username:
+            acc.username = text; changed = True
+        elif col == 2:
+            new_proxy = text or None
+            if new_proxy != (acc.proxy or None):
+                acc.proxy = new_proxy; changed = True
+        elif col == 3 and text != (acc.device_id or ""):
+            acc.device_id = self._ensure_device_id(text, acc.username); changed = True
+            self._suppress_item_changed = True
+            try:
+                it = QTableWidgetItem(acc.device_id)
+                it.setFlags(it.flags() | Qt.ItemFlag.ItemIsEditable)
+                self.tbl.setItem(row, 3, it)
+            finally:
+                self._suppress_item_changed = False
+        if changed:
+            acc.token = None; acc.last_login_at = None
+            self._suppress_item_changed = True
+            try:
+                tok_it = QTableWidgetItem(""); tok_it.setFlags(tok_it.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                self.tbl.setItem(row, 4, tok_it)
+                last_it = QTableWidgetItem(""); last_it.setFlags(last_it.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                self.tbl.setItem(row, 5, last_it)
+            finally:
+                self._suppress_item_changed = False
+            self.account_row_by_username = {a.username.lower(): i for i,a in enumerate(self.accounts)}
+            self.worker.accounts = self.accounts
+            self.save_settings()
+
+    def on_account_updated(self, row: int, data: list):
+        self._suppress_item_changed = True
+        try:
+            for col, val in enumerate(data):
+                it = QTableWidgetItem(str(val))
+                if col in (1, 4, 5):
+                    it.setFlags(it.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                self.tbl.setItem(row, col, it)
+            it_status = self.tbl.item(row, self.STATUS_COL)
+            if it_status:
+                it_status.setFlags(it_status.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            it_curr = self.tbl.item(row, self.CURRENT_COL)
+            if it_curr:
+                it_curr.setFlags(it_curr.flags() & ~Qt.ItemFlag.ItemIsEditable)
+        finally:
+            self._suppress_item_changed = False
+
+    def on_account_progress(self, username: str, done: int, total: int, status_text: str, current_club: str):
+        row = self.account_row_by_username.get(username.lower())
+        if row is None:
+            return
+        w = self.tbl.cellWidget(row, self.PROG_COL)
+        if isinstance(w, QProgressBar):
+            w.setRange(0, max(total,1))
+            w.setValue(max(0, min(done, total)))
+            percent = (0 if total == 0 else int((done/total)*100))
+            w.setFormat(f"{done}/{total} ({percent}%)")
+        it_status = QTableWidgetItem(status_text); it_status.setFlags(it_status.flags() & ~Qt.ItemFlag.ItemIsEditable)
+        self.tbl.setItem(row, self.STATUS_COL, it_status)
+        it_curr = QTableWidgetItem(current_club); it_curr.setFlags(it_curr.flags() & ~Qt.ItemFlag.ItemIsEditable)
+        self.tbl.setItem(row, self.CURRENT_COL, it_curr)
+
+    def on_join_result(self, jr: JoinResult):
+        self.report_rows.append(jr)
+
+    def on_add_account(self):
+        dialog = AccountDialog(parent=self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            data = dialog.get_account_data()
+            dev = self._ensure_device_id('', data['username'])
+            acc = Account(username=data['username'], password=data['password'], device_id=dev, proxy=data['proxy'])
+            self.accounts.append(acc)
+            self._append_account_row(acc)
+            self.worker.accounts = self.accounts
+            self.save_settings()
+            self.log.appendPlainText(f"{Icons.SUCCESS} Добавлен аккаунт: {acc.username}")
+
+    def on_edit_account(self):
+        rows = sorted({idx.row() for idx in self.tbl.selectedIndexes()})
+        if not rows:
+            QMessageBox.information(self, "Выбор", "Выберите строку для редактирования"); return
+        if len(rows) > 1:
+            QMessageBox.information(self, "Выбор", "Выберите только одну строку для редактирования"); return
+        row = rows[0]
+        if row >= len(self.accounts):
+            return
+        acc = self.accounts[row]
+        dialog = AccountDialog(account=acc, parent=self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            data = dialog.get_account_data()
+            acc.username = data['username']; acc.password = data['password']; acc.proxy = data['proxy']
+            acc.token = None; acc.last_login_at = None
+            for col, val in enumerate(acc.as_row()):
+                self.tbl.setItem(row, col, QTableWidgetItem(str(val)))
+            self.account_row_by_username[acc.username.lower()] = row
+            self.worker.accounts = self.accounts
+            self.save_settings()
+            self.log.appendPlainText(f"{Icons.SUCCESS} Отредактирован аккаунт: {acc.username}")
+
+    def on_delete_account(self):
+        rows = sorted({idx.row() for idx in self.tbl.selectedIndexes()}, reverse=True)
+        if not rows:
+            QMessageBox.information(self, "Выбор", "Выберите строки для удаления"); return
+        reply = QMessageBox.question(self, "Подтверждение", f"Удалить {len(rows)} аккаунт(ов)?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if reply == QMessageBox.StandardButton.Yes:
+            deleted = []
+            for r in rows:
+                if r < len(self.accounts):
+                    deleted.append(self.accounts[r].username)
+                    del self.accounts[r]; self.tbl.removeRow(r)
+            self.worker.accounts = self.accounts
+            self.save_settings()
+            if deleted:
+                self.log.appendPlainText(f"{Icons.SUCCESS} Удалены аккаунты: {', '.join(deleted)}")
+
+    def on_add_clubs(self):
+        dialog = ClubIdDialog(parent=self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            new_club_ids = dialog.get_club_ids()
+            if new_club_ids:
+                existing = set(self.club_ids)
+                added = []
+                for club_id in new_club_ids:
+                    if club_id not in existing:
+                        self.club_ids.append(club_id)
+                        existing.add(club_id)
+                        added.append(club_id)
+                if self.chk_shuffle.isChecked() and self.club_ids:
+                    import random; random.shuffle(self.club_ids)
+                    self.log.appendPlainText(f"{Icons.INFO} Список клубов перемешан")
+                self.update_clubs_count(); self.save_settings()
+                if added:
+                    self.log.appendPlainText(f"{Icons.SUCCESS} Добавлено {len(added)} новых клубов: {', '.join(added)}")
+                else:
+                    self.log.appendPlainText(f"{Icons.INFO} Все введённые клубы уже есть в списке")
+            else:
+                QMessageBox.information(self, "Данные", "Не введено ни одного корректного ID клуба")
+
+    def on_clear_clubs(self):
+        if self.club_ids:
+            reply = QMessageBox.question(self, "Подтверждение", f"Очистить список из {len(self.club_ids)} клубов?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            if reply == QMessageBox.StandardButton.Yes:
+                self.club_ids.clear(); self.update_clubs_count(); self.save_settings(); self.log.appendPlainText(f"{Icons.SUCCESS} Список клубов очищен")
+        else:
+            QMessageBox.information(self, "Список пуст", "Список клубов уже пуст")
+
+    def on_load_accounts(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Выберите файл с аккаунтами", "", "Excel (*.xlsx)")
+        if not path:
+            return
+        import pandas as pd
+        df = pd.read_excel(path)
+        df.columns = [str(c).lower().strip() for c in df.columns]
+        if not {"username", "password"}.issubset(df.columns):
+            QMessageBox.critical(self, "Ошибка", "Требуются колонки: username, password"); return
+        self.accounts.clear(); self.tbl.setRowCount(0)
+        for _, row in df.iterrows():
+            proxy_val = row.get("proxy"); proxy_val = (None if (pd.isna(proxy_val) or str(proxy_val).strip()=="") else str(proxy_val).strip())
+            device_id_val = row.get("device_id"); device_id_str = str(device_id_val).strip() if device_id_val is not None and not pd.isna(device_id_val) else ""
+            username = str(row['username']).strip()
+            dev = self._ensure_device_id(device_id_str, username)
+            acc = Account(username=username, password=str(row['password']).strip(), proxy=proxy_val, device_id=dev)
+            self.accounts.append(acc); self._append_account_row(acc)
+        self.worker.accounts = self.accounts
+        self.save_settings()
+        self.log.appendPlainText(f"{Icons.SUCCESS} Загружено {len(self.accounts)} аккаунтов")
+
+    def on_load_clubs(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Выберите файл с клубами", "", "Excel (*.xlsx)")
+        if not path: return
+        import pandas as pd
+        df = pd.read_excel(path)
+        col = None
+        for c in df.columns:
+            if str(c).lower() in ("club_id","id","clubid"):
+                col = c; break
+        if not col:
+            QMessageBox.critical(self, "Ошибка", "Не найдена колонка 'club_id'"); return
+        self.club_ids = [str(x) for x in df[col].dropna().astype(str).tolist()]
+        if self.chk_shuffle.isChecked():
+            import random; random.shuffle(self.club_ids)
+        self.update_clubs_count(); self.save_settings()
+        self.log.appendPlainText(f"{Icons.SUCCESS} Загружено {len(self.club_ids)} ID клубов")
+
+    def on_load_club_distribution(self):
+        if not self.accounts:
+            QMessageBox.critical(self, "Ошибка", "Сначала загрузите аккаунты!"); return
+        path, _ = QFileDialog.getOpenFileName(self, "Выберите файл с распределением клубов", "", "Excel (*.xlsx)")
+        if not path: return
+        try:
+            import pandas as pd
+            df = pd.read_excel(path)
+            df.columns = [str(c).lower().strip() for c in df.columns]
+            username_col = clubs_count_col = None
+            for c in df.columns:
+                if str(c).lower() in ("username", "user", "имя пользователя", "логин", "аккаунт"):
+                    username_col = c
+                if str(c).lower() in ("clubs_count", "clubs", "количество клубов", "клубов", "count"):
+                    clubs_count_col = c
+            if not username_col or not clubs_count_col:
+                QMessageBox.critical(self, "Ошибка", "Не найдены нужные колонки в файле"); return
+            self.worker.account_club_limits.clear()
+            loaded = 0
+            for _, row in df.iterrows():
+                username = str(row[username_col]).strip()
+                try:
+                    clubs_count = int(row[clubs_count_col]); clubs_count = max(0, clubs_count)
+                except Exception:
+                    continue
+                if any(acc.username.lower()==username.lower() for acc in self.accounts):
+                    self.worker.account_club_limits[username.lower()] = clubs_count
+                    loaded += 1
+            if loaded == 0:
+                QMessageBox.warning(self, "Предупреждение", "Не найдено совпадений аккаунтов"); return
+            self.log.appendPlainText(f"{Icons.SUCCESS} Загружено распределение для {loaded} аккаунтов")
+        except Exception as e:
+            QMessageBox.critical(self, "Ошибка загрузки", str(e))
+
+    def on_login_all(self):
+        if not self.accounts:
+            QMessageBox.critical(self, "Ошибка", "Сначала загрузите аккаунты"); return
+        if self.worker.isRunning():
+            QMessageBox.information(self, "Занято", "Процесс уже выполняется"); return
+        self.worker.set_task(self.worker.task_login_all)
+        self.worker.start()
+
+    def on_logout_selected(self):
+        rows = sorted({idx.row() for idx in self.tbl.selectedIndexes()})
+        if not rows:
+            QMessageBox.information(self, "Выбор", "Выберите строки для выхода"); return
+        if self.worker.isRunning():
+            QMessageBox.information(self, "Занято", "Процесс уже выполняется"); return
+        self.worker.set_task(self.worker.task_logout_selected, rows)
+        self.worker.start()
+
+    def on_join(self):
+        if not self.club_ids:
+            QMessageBox.critical(self, "Ошибка", "Сначала загрузите клубы"); return
+        if not any(a.token for a in self.accounts):
+            QMessageBox.critical(self, "Ошибка", "Сначала войдите в аккаунты (нет токенов)"); return
+        if self.worker.isRunning():
+            QMessageBox.information(self, "Занято", "Процесс уже выполняется"); return
+        clubs_to_process = self.club_ids.copy()
+        if self.chk_shuffle.isChecked():
+            import random; random.shuffle(clubs_to_process); self.log.appendPlainText(f"{Icons.INFO} Список клубов перемешан для обработки")
+        limit = self.spn_clubs_per_account.value()
+        dmin = self.spn_delay_min.value(); dmax = self.spn_delay_max.value()
+        if dmax < dmin:
+            dmin, dmax = dmax, dmin
+        message_text = self.txt_message.text().strip()
+        self.worker.set_task(self.worker.task_join_round, clubs_to_process, limit, dmin, dmax, message_text, int(self.spn_join_threads.value()))
+        self.worker.start()
+
+    def on_pause(self):
+        if not self.worker.isRunning():
+            QMessageBox.information(self, "Пауза", "Нет активного процесса для паузы"); return
+        self.worker.pause_toggle()
+
+    def on_worker_pause_changed(self, paused: bool):
+        self.btn_pause.setText("▶️ Продолжить" if paused else "⏸ Пауза")
+        self.save_settings()
+
+    def on_worker_started(self):
+        try:
+            self.btn_stop.setEnabled(True)
+            self.btn_pause.setEnabled(True)
+            self.btn_pause.setText("⏸ Пауза")
+            self.btn_join.setEnabled(False)
+            self.btn_login.setEnabled(False)
+            self.btn_logout.setEnabled(False)
+        except Exception:
+            pass
+
+    def on_worker_finished(self):
+        try:
+            self.btn_stop.setEnabled(False)
+            self.btn_pause.setEnabled(False)
+            self.btn_pause.setText("⏸ Пауза")
+            self.btn_join.setEnabled(True)
+            self.btn_login.setEnabled(True)
+            self.btn_logout.setEnabled(True)
+        except Exception:
+            pass
+
+    def on_generate_accounts(self):
+        default_proxies_text = getattr(self, 'reg_proxies_last', '')
+        dmin = getattr(self, 'reg_delay_min_last', 400)
+        dmax = getattr(self, 'reg_delay_max_last', 900)
+        def_set_avatar = getattr(self, 'reg_set_avatar_last', True)
+        def_threads = getattr(self, 'reg_threads_last', 1)
+        def_ppt = getattr(self, 'reg_ppt_last', 0)
+        def_avatar_path = getattr(self, 'reg_avatar_path_last', '')
+        dlg = GenerateAccountsDialog(default_count=int(getattr(self, 'reg_count_last', 100)), default_proxies_text=default_proxies_text, default_dmin=dmin, default_dmax=dmax, default_set_avatar=def_set_avatar, default_threads=def_threads, default_ppt=def_ppt, default_avatar_path=def_avatar_path, parent=self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        cnt, proxies_list, delay_min_ms, delay_max_ms, set_avatar, threads, ppt, avatar_path = dlg.get_values()
+        if cnt <= 0:
+            return
+        if self.worker.isRunning():
+            QMessageBox.information(self, "Занято", "Процесс уже выполняется"); return
+        self.reg_count_last = int(cnt)
+        self.reg_proxies_last = "\n".join(proxies_list)
+        self.reg_delay_min_last = int(delay_min_ms)
+        self.reg_delay_max_last = int(delay_max_ms)
+        self.reg_set_avatar_last = bool(set_avatar)
+        self.reg_threads_last = int(max(1, threads))
+        self.reg_ppt_last = int(max(0, ppt))
+        self.reg_avatar_path_last = avatar_path or getattr(self, 'reg_avatar_path_last', '')
+        self.save_settings()
+        if int(threads) > 1:
+            self.worker.set_task(self.worker.task_register_fishpoker_parallel, cnt, True, bool(set_avatar), 'files/words.txt', None, delay_min_ms, delay_max_ms, proxies_list, int(threads), int(ppt), (avatar_path or None))
+        else:
+            self.worker.set_task(self.worker.task_register_fishpoker, cnt, True, bool(set_avatar), 'files/words.txt', None, delay_min_ms, delay_max_ms, proxies_list, (avatar_path or None))
+        self.worker.start()
+
+    def on_stop(self):
+        if self.worker.isRunning():
+            self.worker.stop(); self.log.appendPlainText(f"{Icons.WARNING} 🛑 Запрос на остановку отправлен...")
+        else:
+            QMessageBox.information(self, "Остановка", "Нет активных процессов для остановки")
+
+    def on_task_finished(self):
+        # Не сбрасываем внутренние флаги worker здесь — это ломает мгновенную остановку.
+        try:
+            self.btn_stop.setEnabled(False)
+            self.btn_pause.setEnabled(False)
+            self.btn_pause.setText("⏸ Пауза")
+        except Exception:
+            pass
+
+    def on_new_account(self, acc: Account):
+        self.accounts.append(acc)
+        self._append_account_row(acc)
+        self.worker.accounts = self.accounts
+        try:
+            self.account_row_by_username[acc.username.lower()] = len(self.accounts)-1
+        except Exception:
+            pass
+        self.log.appendPlainText(f"{Icons.SUCCESS} Добавлен зарегистрированный аккаунт: {acc.username}")
+        self.save_settings()
+
+    def on_export_report(self):
+        if not self.report_rows:
+            QMessageBox.information(self, "Нет данных", "Пока нет данных для отчета"); return
+        path, _ = QFileDialog.getSaveFileName(self, "Сохранить отчет", "", "Excel (*.xlsx)")
+        if not path: return
+        try:
+            import pandas as pd
+            report_data = []
+            for jr in self.report_rows:
+                report_data.append(jr.as_dict() if hasattr(jr, 'as_dict') else jr)
+            df = pd.DataFrame(report_data)
+            if len(df.columns) > 0:
+                column_order = [col for col in REPORT_COLUMNS if col in df.columns]
+                if column_order:
+                    df = df[column_order]
+            df.to_excel(path, index=False)
+            self.log.appendPlainText(f"{Icons.SUCCESS} Отчет сохранен: {path}")
+            self.log.appendPlainText(f"{Icons.INFO} Экспортировано записей: {len(report_data)}")
+        except Exception as e:
+            QMessageBox.critical(self, "Ошибка экспорта", str(e))
+
+    def update_clubs_count(self):
+        self.clubs_count_label.setText(f"Клубов: {len(self.club_ids)}")
+
+    def save_settings(self):
+        settings = {
+            'accounts': [{
+                'username': acc.username,
+                'password': acc.password,
+                'device_id': acc.device_id,
+                'proxy': acc.proxy,
+                'refresh_token': acc.refresh_token,
+                'access_token_expire': acc.access_token_expire,
+                'refresh_token_expire': acc.refresh_token_expire,
+            } for acc in self.accounts],
+            'club_ids': self.club_ids,
+            'settings': {
+                'clubs_per_account': self.spn_clubs_per_account.value(),
+                'delay_min_ms': self.spn_delay_min.value(),
+                'delay_max_ms': self.spn_delay_max.value(),
+                'shuffle_clubs': self.chk_shuffle.isChecked(),
+                'apply_message': self.txt_message.text(),
+                'join_threads': int(self.spn_join_threads.value()),
+                'reg_count': int(getattr(self, 'reg_count_last', 100)),
+                'reg_proxies': getattr(self, 'reg_proxies_last', ''),
+                'reg_delay_min_ms': int(getattr(self, 'reg_delay_min_last', 400)),
+                'reg_delay_max_ms': int(getattr(self, 'reg_delay_max_last', 900)),
+                'reg_set_avatar': bool(getattr(self, 'reg_set_avatar_last', True)),
+                'reg_threads': int(getattr(self, 'reg_threads_last', 1)),
+                'reg_proxies_per_thread': int(getattr(self, 'reg_ppt_last', 0)),
+                'reg_avatar_path': str(getattr(self, 'reg_avatar_path_last', '')),
+            }
+        }
+        try:
+            from pathlib import Path
+            p = Path('files')/"fishpoker_settings.json"
+            with open(p, 'w', encoding='utf-8') as f:
+                json.dump(settings, f, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
+
+    def load_settings(self):
+        from pathlib import Path
+        p = Path('files')/"fishpoker_settings.json"
+        if not p.exists():
+            self.log.appendPlainText(f"{Icons.INFO} Файл настроек FishPoker не найден, используем значения по умолчанию")
+            return
+        try:
+            if p.stat().st_size == 0:
+                raise ValueError("empty settings file")
+            with open(p, 'r', encoding='utf-8') as f:
+                settings = json.load(f)
+            self.accounts.clear(); self.tbl.setRowCount(0)
+            for acc_data in settings.get('accounts', []):
+                raw_dev = acc_data.get('device_id') or ""
+                uname = acc_data.get('username','')
+                acc = Account(
+                    username=uname,
+                    password=acc_data.get('password',''),
+                    device_id=self._ensure_device_id(raw_dev, uname),
+                    proxy=acc_data.get('proxy'),
+                )
+                acc.refresh_token = acc_data.get('refresh_token')
+                acc.access_token_expire = acc_data.get('access_token_expire')
+                acc.refresh_token_expire = acc_data.get('refresh_token_expire')
+                self.accounts.append(acc); self._append_account_row(acc)
+            self.club_ids = settings.get('club_ids', [])
+            self.update_clubs_count()
+            ui = settings.get('settings', {})
+            self.spn_clubs_per_account.setValue(ui.get('clubs_per_account', 500))
+            self.spn_delay_min.setValue(ui.get('delay_min_ms', 500))
+            self.spn_delay_max.setValue(ui.get('delay_max_ms', 1500))
+            self.chk_shuffle.setChecked(ui.get('shuffle_clubs', True))
+            self.txt_message.setText(ui.get('apply_message',''))
+            try:
+                self.spn_join_threads.setValue(int(ui.get('join_threads', 64)))
+            except Exception:
+                pass
+            self.reg_count_last = int(ui.get('reg_count', 100))
+            self.reg_proxies_last = ui.get('reg_proxies','')
+            self.reg_delay_min_last = int(ui.get('reg_delay_min_ms', 400))
+            self.reg_delay_max_last = int(ui.get('reg_delay_max_ms', 900))
+            self.reg_set_avatar_last = bool(ui.get('reg_set_avatar', True))
+            self.reg_threads_last = int(ui.get('reg_threads', 1))
+            self.reg_ppt_last = int(ui.get('reg_proxies_per_thread', 0))
+            self.reg_avatar_path_last = ui.get('reg_avatar_path', '')
+            self.worker.accounts = self.accounts
+            self.log.appendPlainText(f"{Icons.SUCCESS} Загружены настройки: {len(self.accounts)} аккаунтов, {len(self.club_ids)} клубов")
+        except Exception:
+            try:
+                p.rename(p.with_suffix('.bak'))
+            except Exception:
+                pass
+            self.accounts.clear(); self.tbl.setRowCount(0); self.club_ids = []; self.update_clubs_count()
+            self.log.appendPlainText(f"{Icons.ERROR} Ошибка загрузки настроек FishPoker. Загружены значения по умолчанию")
+
+
 class PPPokerTab(QWidget):
     def update_table_theme(self) -> None:
         """Светлая/тёмная тема таблицы — как у XPoker, но селекторы без id для строгого применения."""
@@ -3558,23 +5415,6 @@ class PPPokerTab(QWidget):
         self.btn_pause.setEnabled(False)
         self.btn_pause.setText("⏸ Пауза")
 
-    def on_task_finished(self):
-        """Сброс внутренних флагов после завершения задачи (как в XPoker)."""
-        try:
-            self.worker._stop = False
-            self.worker._pause = False
-            try:
-                self.worker._cancel_event.clear()
-            except Exception:
-                pass
-            self.worker._last_club_info = {
-                'club_id': None,
-                'username': None,
-                'success': None,
-                'message': None
-            }
-        except Exception:
-            pass
 
     def on_new_account(self, acc: Account):
         # Добавляем аккаунт в таблицу
@@ -3952,6 +5792,18 @@ class MainWindow(QMainWindow):
                 pass
         except Exception as e:
             logging.getLogger(__name__).exception(f"PPPoker tab init failed: {e}")
+
+        # Добавляем вкладку FishPoker
+        try:
+            from fishpoker.api import FishPokerAPI, ApiError as FishApiError
+            self.fp_tab = FishPokerTab(parent=self)
+            self.tabs.addTab(self.fp_tab, "FishPoker")
+            try:
+                self.fp_tab.update_table_theme()
+            except Exception:
+                pass
+        except Exception as e:
+            logging.getLogger(__name__).exception(f"FishPoker tab init failed: {e}")
 
     def on_load_accounts(self):
         """Загрузить аккаунты из Excel файла."""
@@ -4947,21 +6799,10 @@ class MainWindow(QMainWindow):
         self.btn_logout.setEnabled(True)
     
     def on_task_finished(self):
-        """Обработчик завершения задачи - сбрасываем флаг остановки."""
-        self.worker._stop = False
-        self.worker._pause = False
-        # Сбрасываем событие отмены для следующего запуска
-        try:
-            self.worker._cancel_event.clear()
-        except Exception:
-            pass
-        # Очищаем информацию о последнем клубе
-        self.worker._last_club_info = {
-            'club_id': None,
-            'username': None,
-            'success': None,
-            'message': None
-        }
+        """Обработчик завершения задачи.
+        Важно: не сбрасывать здесь self.worker._stop/_cancel_event — это ломает мгновенную остановку.
+        """
+        return
 
     def closeEvent(self, event):
         try:
@@ -4972,6 +6813,12 @@ class MainWindow(QMainWindow):
         try:
             if hasattr(self, 'pp_tab') and self.pp_tab:
                 self.pp_tab.save_settings()
+        except Exception:
+            pass
+        # Сохраним настройки FishPoker вкладки тоже
+        try:
+            if hasattr(self, 'fp_tab') and self.fp_tab:
+                self.fp_tab.save_settings()
         except Exception:
             pass
         super().closeEvent(event)
@@ -5024,6 +6871,11 @@ class MainWindow(QMainWindow):
         try:
             if hasattr(self, 'pp_tab') and self.pp_tab:
                 self.pp_tab.update_table_theme()
+        except Exception:
+            pass
+        try:
+            if hasattr(self, 'fp_tab') and self.fp_tab:
+                self.fp_tab.update_table_theme()
         except Exception:
             pass
         # Обновить выбор в комбобоксе (если меняли программно)

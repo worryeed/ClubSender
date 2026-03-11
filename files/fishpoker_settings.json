@@ -1,0 +1,20 @@
+{
+  "accounts": [],
+  "club_ids": [],
+  "settings": {
+    "clubs_per_account": 500,
+    "delay_min_ms": 500,
+    "delay_max_ms": 1500,
+    "shuffle_clubs": true,
+    "apply_message": "",
+    "join_threads": 64,
+    "reg_count": 100,
+    "reg_proxies": "",
+    "reg_delay_min_ms": 400,
+    "reg_delay_max_ms": 900,
+    "reg_set_avatar": true,
+    "reg_threads": 1,
+    "reg_proxies_per_thread": 0,
+    "reg_avatar_path": ""
+  }
+}
