@@ -1,6 +1,11 @@
 
-# Captcha test scripts
+# Dev-only tools & scripts (not for release)
 tools/xpoker_captcha_reg/
+tools/ggpoker/
+tools/parse_*.py
+
+# Traffic dumps
+*.mitm
 
 # Logs
 *.log
